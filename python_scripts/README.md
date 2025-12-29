@@ -38,9 +38,13 @@ Python packages:
 Install example:
 ```bash
 pip install numpy pandas networkx matplotlib
+```
+
+---
 
 Run example:
 
+```bash
 python percolation_auc_plus_v2.py \
   --edges interface_interactome.tab \
   --sep tab \
@@ -50,7 +54,9 @@ python percolation_auc_plus_v2.py \
   --n-nulls 1000 \
   --n-jobs 16 \
   --out-prefix run_plus_v2
+```
 
+---
 
 Script 2: 
 
@@ -83,14 +89,20 @@ Python packages:
 Install example:
 ```bash
 pip install catboost shap pandas numpy matplotlib seaborn scikit-learn statsmodels
+```
 
+---
 Run example:
 
+```bash
 python node_feature_models_catboost_with_interactions_v3.py \
   --table impact.tsv \
   --outdir results \
   --prefix as_impact_cb
-  
+
+```
+
+---  
 
 Script 3:
 
@@ -139,13 +151,17 @@ Python packages:
 Install example:
 ```bash
 pip install pandas numpy matplotlib scipy statsmodels scikit-learn shap
+```
 
+---
 Run example:
-
+```bash
 python node_feature_models_v1.py \
   --table impact.tsv \
   --out feature_models
+```
 
+---
 Script 4:
 
 # Single-input enrichment workflow + optional quantile regression
@@ -193,13 +209,18 @@ Python packages:
 Install example:
 ```bash
 pip install pandas numpy matplotlib scipy statsmodels
+```
 
+---
 Run example:
 
+```bash
 python node_enrichment_qreg_single.py \
   --in node_impact_with_features.tsv \
   --outdir q_enrich_out
+```
 
+---
 Script 5:
 
 # Plot OLS coefficient summaries from a TSV
@@ -230,10 +251,16 @@ Python packages:
 Install example:
 ```bash
 pip install pandas numpy matplotlib
+```
 
+---
 Run example:
 
+```bash
 python plot_coefficients_from_tsv.py
+```
+
+---
 
 Script 6:
 
@@ -290,7 +317,10 @@ A text file (e.g. `microexon_seqs.txt`) where each non-comment line contains:
 
 Basic run example:
 
+```bash
 python microexon_residue_enrichment_v2.py \
   --in microexon_seqs.txt \
   --outdir enrich_out
+```
 
+---
