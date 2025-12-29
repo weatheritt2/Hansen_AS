@@ -1,0 +1,2492 @@
+---
+title: "Identifying which features are describing isoform-specific behaviours"
+author: "Peter Kjer Hansen"
+date: "2025-04-01"
+output:
+  html_document:
+    fig_width: 12
+    fig_height: 5
+---
+
+# Introduction
+Please set working directory to correct folders AND set thresholds for variable importance
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = "svg")
+
+#packages
+library(tidyverse)
+library(caret)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(broom)
+library(readxl)
+library(ggpmisc) #For easy plots of coefficients on plots
+library(lsr) #Contains cohensD() function
+library(nnet) #Feedforward neural network
+library(UpSetR) #Package for doing upset plots
+library(ggrepel) #Pacakge for making repel text
+library(scales) # Default ggplot colours
+
+#Working directory
+#Exon description dataset
+Path_to_exon_description_sheet <- 'INSERT PATH TO SHEET WITH EXON DESCRIPTIONS'
+File_with_exon_description_sheet <- 'INSERT FILE NAME OF .XLSX WITH EXON DESCRIPTIONS'
+Event_sheet <- 'INSERT SHEET NAME'
+LUMIER_sheet <- 'INSERT SHEET NAME'
+
+# Model folders
+#Postrans
+Postransfected_model_folder <- 'INSERT PATH TO FOLDER WITH CLASSIFIERS TRAINED ON TRANSFECTED CELLS'
+#Negtrans 10 percentile with rep aware sampling, No Golgin
+Negtransfected_model_folder <- 'INSERT PATH TO FOLDER WITH CLASSIFIERS TRAINED ON NON-TRANSFECTED CELLS'
+
+# Cell datasets and summaries
+Cell_data_folder <- 'INSERT PATH TO FOLDER WITH .CSVS CONTAINING THE SINGLE CELL MEASUREMENTS'
+
+# Bootstrap confidence threshold
+bootstrap_confidence_threshold <- 0.99
+
+### Thresholds for important variables
+# Threshold for the contribution ratio (pos_trans / neg_trans). Higher is more stringent
+ratio_threshold <- 2.6
+# Threshold for the contribution ratio X contribution prop (positive) variable. Higher is more stringent
+ratio_times_importance_threshold <- 1.5
+
+#
+transfection_threshold <- 0.00065
+```
+
+```{r ISoform pair descriptions, echo = FALSE}
+# Replications of sampling + classifier training + assessment
+#Pairs to be test for the various sets
+#These are the actual isoform tests
+PAIRS_1A <- c('PAIR_01','PAIR_02','PAIR_03','PAIR_04','PAIR_05','PAIR_06','PAIR_07','PAIR_08','PAIR_09','PAIR_10', 'PAIR_PosControl', 'PAIR_RAB5A')
+PAIRS_1A_alternative_comps <- c('PAIR_03DExVSPanEx','PAIR_03bothEx','PAIR_03ExVsEx','PAIR_03Ex1VsBoth')
+PAIRS_B <- c('PAIR_01','PAIR_02','PAIR_03','PAIR_04','PAIR_05','PAIR_06','PAIR_07','PAIR_08','PAIR_09','PAIR_10')
+PAIRS_C <- c('PAIR_02','PAIR_04','PAIR_05','PAIR_06','PAIR_07','PAIR_08','PAIR_09','PAIR_10')
+#
+PAIRS_D_wo_01 <- c('PAIR_02','PAIR_05','PAIR_08','PAIR_09')
+PAIRS_D_alternative_comps <- c('PAIR_01wtVS57','PAIR_01wtVS168','PAIR_01dex57VS168','PAIR_08DExVSaltEx','PAIR_08bothEx','PAIR_08ExVsEx','PAIR_08Ex1VsBoth')
+
+```
+
+```{r Function to load in the classifier performance and importance, echo=FALSE}
+#
+Replicate_performance_and_importance <- function(MODEL_FOLDER, SET, PAIR, TRANSFECTION_STATUS, PERCENTILE_CUTOFF = 0){
+  if(TRANSFECTION_STATUS == 'POSITIVE'){
+    load(paste0(MODEL_FOLDER,'/',SET,'_',PAIR))
+  }
+  if(TRANSFECTION_STATUS == 'NEGATIVE'){
+    load(paste0(MODEL_FOLDER,'/NegTransModel_',SET,'_',PAIR))
+  }
+  #
+  modeL_fit_and_tune <- function(variable){
+    a <- variable$results %>%
+      dplyr::filter(!is.na(ROC)) %>% 
+      dplyr::arrange(desc(ROC)) %>% 
+      dplyr::slice_head(n = 1) %>% 
+      dplyr::mutate(size_decay_tune = paste0('size:',size,'_decay:',decay))
+    return(a)
+  }
+  #
+  variable_importance_ranking <- function(variable){
+    variable_importance <- variable$variable_importance %>% 
+      arrange(desc(Overall)) %>%
+      rownames_to_column(var = 'Feature') %>% 
+      as_tibble()
+    
+    rank <- seq(1, dim(variable_importance)[1])
+    
+    variable_importance <- bind_cols(variable_importance, 'Rank' = rank)
+    return(variable_importance)
+  }
+  #
+  n_cells <- function(variable){
+    cell_count <- variable$training_data_intensity %>% 
+    count()
+    return(cell_count)
+  }
+  #
+  
+  ISOFORM_MODELS <- as.list(replicate_nnet[1,]) #Converts matrix rows into lists
+  NEGATIVE_MODELS <- as.list(replicate_nnet[2,])
+  POSITIVE_MODELS <- as.list(replicate_nnet[3,])
+  
+  #
+  isoform_model_fit_and_tune <- lapply(ISOFORM_MODELS, FUN = modeL_fit_and_tune)
+  isoform_variable_importance <- lapply(ISOFORM_MODELS, FUN = variable_importance_ranking)
+  isoform_n_cells <- lapply(ISOFORM_MODELS, FUN = n_cells)
+  #
+  negative_fit_and_tune <- lapply(NEGATIVE_MODELS, FUN = modeL_fit_and_tune)
+  negative_variable_importance <- lapply(NEGATIVE_MODELS, FUN = variable_importance_ranking)
+  negative_n_cells <- lapply(NEGATIVE_MODELS, FUN = n_cells)
+  #
+  positive_fit_and_tune <- lapply(POSITIVE_MODELS, FUN = modeL_fit_and_tune)
+  positive_variable_importance <- lapply(POSITIVE_MODELS, FUN = variable_importance_ranking)
+  positive_n_cells <- lapply(POSITIVE_MODELS, FUN = n_cells)
+  
+  #
+  iso_performance <- bind_rows(isoform_model_fit_and_tune, .id = 'Replicate')
+  neg_performance <- bind_rows(negative_fit_and_tune, .id = 'Replicate')
+  pos_performance <- bind_rows(positive_fit_and_tune, .id = 'Replicate') %>% 
+    rename_with(~paste0(.,"_pos"), -Replicate)
+  
+  #
+  iso_n <- bind_rows(isoform_n_cells, .id = 'Replicate')
+  neg_n <- bind_rows(negative_n_cells, .id = 'Replicate')
+  pos_n <- bind_rows(positive_n_cells, .id = 'Replicate')
+  n_cells_all_models <- bind_rows(iso_n, neg_n, pos_n, .id = 'Group')%>% 
+    dplyr::mutate('Group' = as_factor(case_when(Group == 1 ~ 'Isoform',
+                                                Group == 2 ~ 'Negative',
+                                                Group == 3 ~ 'Positive')),
+                  'Group' = fct_relevel(Group, 'Negative','Isoform', 'Positive'))
+  
+  ###
+  pair_x_performance <- bind_rows(iso_performance, neg_performance, bind_rows(positive_fit_and_tune, .id = 'Replicate'),.id = 'Group') %>% 
+    dplyr::mutate('Group' = as_factor(case_when(Group == 1 ~ 'Isoform',
+                                                Group == 2 ~ 'Negative',
+                                                Group == 3 ~ 'Positive')),
+                  'Group' = fct_relevel(Group, 'Negative','Isoform', 'Positive'))
+  
+  #
+  
+  ###
+  relative_performance <- full_join(x = iso_performance, y = neg_performance, by = c('Replicate'), suffix = c('_iso', '_neg')) %>% 
+    full_join(x = ., y = pos_performance, by = c('Replicate')) %>% 
+    dplyr::mutate('ROC_difference_from_neg' = ROC_iso - ROC_neg,
+                  'ROC_difference_from_pos' = ROC_iso - ROC_pos,
+                  'ROC_difference_pos_from_neg' = ROC_pos - ROC_neg)
+  
+  #
+  
+  ###
+  number_of_classifier_iterations <- length(isoform_variable_importance)
+  number_of_features <- length(unique(isoform_variable_importance[[1]]$Feature))
+  #
+  iso_importance <- bind_rows(isoform_variable_importance, .id = 'Replicate') %>% 
+    ungroup() %>% 
+    group_by(Feature) %>% 
+    summarize('Rank_sum' = sum(Rank),
+              'Rank_median' = median(Rank),
+              'Rank_05percent' = quantile(Rank, probs = c(0.05)),
+              'Rank_10percent' = quantile(Rank, probs = c(0.1)),
+              'Rank_25percent' = quantile(Rank, probs = c(0.25)),
+              'Rank_75percent' = quantile(Rank, probs = c(0.75)),
+              'Rank_90percent' = quantile(Rank, probs = c(0.9)),
+              'Rank_95percent' = quantile(Rank, probs = c(0.95)),
+              'Overall_sum' = sum(Overall),
+              'Overall_sd' = sd(Overall)) %>% 
+    dplyr::mutate('No_iterations' = number_of_classifier_iterations,
+                  'Highest_potential_overall' = 100 * number_of_classifier_iterations,
+                  'Highest_potential_rank' = number_of_classifier_iterations,
+                  'Lowest_potential_rank' = number_of_classifier_iterations * number_of_features,
+                  'Rank_75_25' = Rank_75percent - Rank_25percent,
+                  'Rank_90_10' = Rank_90percent - Rank_10percent,
+                  'Rank_95_05' = Rank_95percent - Rank_05percent) %>%
+    dplyr::mutate('Rank_avg' = Rank_sum/No_iterations,
+                  'Overall_avg' = Overall_sum/No_iterations) %>% 
+    dplyr::arrange(Rank_sum)
+  #
+  neg_importance <- bind_rows(negative_variable_importance, .id = 'Replicate') %>% 
+    ungroup() %>% 
+    group_by(Feature) %>% 
+    summarize('Rank_sum' = sum(Rank),
+              'Rank_median' = median(Rank),
+              'Rank_05percent' = quantile(Rank, probs = c(0.05)),
+              'Rank_10percent' = quantile(Rank, probs = c(0.1)),
+              'Rank_25percent' = quantile(Rank, probs = c(0.25)),
+              'Rank_75percent' = quantile(Rank, probs = c(0.75)),
+              'Rank_90percent' = quantile(Rank, probs = c(0.9)),
+              'Rank_95percent' = quantile(Rank, probs = c(0.95)),
+              'Overall_sum' = sum(Overall),
+              'Overall_sd' = sd(Overall)) %>% 
+    dplyr::mutate('No_iterations' = number_of_classifier_iterations,
+                  'Highest_potential_overall' = 100 * number_of_classifier_iterations,
+                  'Highest_potential_rank' = number_of_classifier_iterations,
+                  'Lowest_potential_rank' = number_of_classifier_iterations * number_of_features,
+                  'Rank_75_25' = Rank_75percent - Rank_25percent,
+                  'Rank_90_10' = Rank_90percent - Rank_10percent,
+                  'Rank_95_05' = Rank_95percent - Rank_05percent) %>%
+    dplyr::mutate('Rank_avg' = Rank_sum/No_iterations,
+                  'Overall_avg' = Overall_sum/No_iterations) %>% 
+    dplyr::arrange(Rank_sum)
+  #
+  neg_importance_reduced <- neg_importance %>% 
+    dplyr::select(Feature, Rank_sum, Rank_avg, Rank_median, Rank_90_10, Rank_95_05, Overall_sum, Overall_avg, Overall_sd)
+  
+    #
+  iso_neg_comb_importance <- dplyr::full_join(x = iso_importance, y = neg_importance_reduced, by = c('Feature'), suffix = c('','_neg')) %>% 
+    dplyr::mutate('Rank_median_difference' = Rank_median_neg - Rank_median,
+                  'Rank_sum_difference' = Rank_sum_neg - Rank_sum,
+                  'Rank_90_10_difference' = Rank_90_10_neg - Rank_90_10,
+                  'Rank_95_05_difference' = Rank_95_05_neg - Rank_95_05)
+  
+  
+  #
+  
+  results_list <- list('performance' = pair_x_performance, 'SET' = SET, 'PAIR' = PAIR, 'relative_performance' = relative_performance, 'TRANSFECTION_STATUS' = TRANSFECTION_STATUS, 'PERCENTILE_CUTOFF' = PERCENTILE_CUTOFF,
+                       'var_importance_iso' = iso_importance, 'var_importance_neg' = negative_variable_importance, 'var_importance_pos' = positive_variable_importance,
+                       'var_importance_iso_w_contrast' = iso_neg_comb_importance, 'n_cells' = n_cells_all_models)
+  return(results_list)
+}
+```
+
+```{r Loading Positive transfectant models, echo = FALSE}
+#Reading in all the models (For 1, A, 1A, B, C, and E)
+#Positive transfectant models
+#####
+
+#Set 1A
+for(i in PAIRS_1A){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_1A',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+  #
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set 1A alternative comparisons
+for(i in PAIRS_1A_alternative_comps){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_1A',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set B
+for(i in PAIRS_B){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_B',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set C
+for(i in PAIRS_C){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_C',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set D
+for(i in PAIRS_D_wo_01){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_D',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set D, alternative comparisons
+for(i in PAIRS_D_alternative_comps){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Postransfected_model_folder,
+                                               SET = 'SET_D',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'POSITIVE')
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('postrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('postrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('postrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+```
+
+```{r Loading negative transfectant models 10 percentile, echo = FALSE}
+#Reading in all the models (For 1, A, 1A, B, C, and E)
+#Negative transfectant models
+#####
+
+#Set 1A
+for(i in PAIRS_1A){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_1A',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+  #
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set 1A alternative comparisons
+for(i in PAIRS_1A_alternative_comps){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_1A',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set B
+for(i in PAIRS_B){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_B',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#Set C
+for(i in PAIRS_C){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_C',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#
+for(i in PAIRS_D_wo_01){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_D',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+#SET D, ALTERNATIVE COMPARISONS
+for(i in PAIRS_D_alternative_comps){
+  test <- Replicate_performance_and_importance(MODEL_FOLDER = Negtransfected_model_folder,
+                                               SET = 'SET_D',
+                                               PAIR = i,
+                                               TRANSFECTION_STATUS = 'NEGATIVE',
+                                               PERCENTILE_CUTOFF = 10)
+  
+  #Creates absolute performance metrics (single metrics)
+  assign(paste0('negtrans_model_performance_',test$SET,'_',test$PAIR),test$performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF) %>% 
+           left_join(., y = test$n_cells, by = c('Replicate','Group')))
+  #Creates relative performance object
+  assign(paste0('negtrans_relative_performance_',test$SET,'_',test$PAIR), test$relative_performance %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+  #Creates variable importance object
+  assign(paste0('negtrans_iso_variable_contrast_importance_',test$SET,'_',test$PAIR), test$var_importance_iso_w_contrast %>% 
+           dplyr::mutate('SET' = test$SET,
+                         'ISOFORM_PAIR' = test$PAIR,
+                         'TRANSFECTION_STATUS' = test$TRANSFECTION_STATUS,
+                         'PERCENTILE_CUTOFF' = test$PERCENTILE_CUTOFF))
+}
+
+```
+
+```{r Loading exon descriptions, echo = FALSE}
+#Exon description
+Exon_descriptions <- readxl::read_xlsx(path = paste0(Path_to_exon_description_sheet, File_with_exon_description_sheet),
+                                       sheet = Event_sheet) %>% 
+  dplyr::mutate('microexon' = Exon_length_NT <= 30) %>% 
+  dplyr::mutate(Gene_name_Rclassifier = case_when( #Note, currently because names in SET D are marked w. asteriks, they have to be so in this exon description file. But excel didn't like starting the name w. an asteriks.
+    Gene_name_Rclassifier == 'ATXN2' ~ '*ATXN2', #Only done for the isoform pairs that are not recurring
+    Gene_name_Rclassifier == 'EVI5' ~ '*EVI5',
+    Gene_name_Rclassifier == 'PPFIA1' ~ '*PPFIA1',
+    Gene_name_Rclassifier == 'CLASP1' & Exon_name_Rclassifier == 'ExA' ~ 'CLASP1_ExA_vs_ExB',
+    Gene_name_Rclassifier == 'CLASP1' & Exon_name_Rclassifier == 'ExB' ~ 'CLASP1_noEx_vs_ExB',
+    Gene_name_Rclassifier == 'CLASP1' & Exon_name_Rclassifier == 'ExA' ~ 'CLASP1_ExA_vs_ExB',
+    Gene_name_Rclassifier == 'CLASP1' & Exon_name_Rclassifier == 'ExB' ~ 'CLASP1_noEx_vs_ExB',
+    .default = Gene_name_Rclassifier))
+
+Exon_descriptions_reduced <- Exon_descriptions %>% 
+  dplyr::select(microexon, Splice_event_enriched_in_neural_tissue, Splice_event_enriched_in_pancreatic_islet_cells, Enrichment_comment, Exon_length_NT, Gene_name_Rclassifier, Exon_name_Rclassifier, EVENT_ID_vastDB, Location_in_protein) #%>% 
+  #dplyr::filter(!c(Gene_name_Rclassifier == 'VAV2')) #Current_naming_doesn't_work_well_with_genes_with_multiple_exons
+
+### ISOFORM_PAIRS_EXCLUDE
+ISOFORM_PAIRS_TO_EXCLUDE_DUE_TO_DOUBLES <- c('VAV2','*SH3KBP1_D/E','*OCRL_D/E','*SH3GLB1_D/E')
+ISOFORM_PAIRS_TO_EXCLUDE_DUE_TO_INTENSITY <- c('VAV2','PACSIN2') ##THIS DEFINES WHICH ISOFORM PAIRS ARE EXCLUDED.
+
+```
+
+```{r combining absolute classifier outputs into proper datasets, echo = FALSE}
+#Combining individual isoforms into proper dataset
+## Absolute performance
+#Set 1A
+combined_model_performance_SET_1A <- bind_rows(mget(ls(pattern = 'model_performance_SET_1A_PAIR'))) #Will contain both SET_1A normal comps and alternative CLASP1 comparisons
+rm(list = ls(pattern = 'model_performance_SET_1A_PAIR'))
+#Set B
+combined_model_performance_SET_B <- bind_rows(mget(ls(pattern = 'model_performance_SET_B_PAIR')))
+rm(list = ls(pattern = 'model_performance_SET_B_PAIR'))
+#Set C
+combined_model_performance_SET_C <- bind_rows(mget(ls(pattern = 'model_performance_SET_C_PAIR')))
+rm(list = ls(pattern = 'model_performance_SET_C_PAIR'))
+#Set D
+combined_model_performance_SET_D <- bind_rows(mget(ls(pattern = 'model_performance_SET_D_PAIR')))
+rm(list = ls(pattern = 'model_performance_SET_D_PAIR'))
+
+#All
+combined_model_performance_all <- bind_rows(mget(ls(pattern = 'combined_model_performance_SET_'))) %>%  #WRITE CASE_WHEN TO GIVE ALL SET + PAIR COMBINATIONS THEIR GENE NAME (COULD POTENTIALLY BE GENE + EXON ID -> ALTHOUGH COMBINATIONS GET TRICKY STILL)
+  dplyr::mutate('Gene_name' = case_when(
+    SET == 'SET_1' & ISOFORM_PAIR == 'PAIR_01' ~ 'ANK2',
+    SET == 'SET_1' & ISOFORM_PAIR == 'PAIR_03' ~ 'CLASP1_noEx_vs_ExA',
+    SET == 'SET_1' & ISOFORM_PAIR == 'PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+    SET == 'SET_1' & ISOFORM_PAIR == 'PAIR_08' ~ 'NUMB',
+    SET == 'SET_1' & ISOFORM_PAIR == 'PAIR_09' ~ 'SNX2',
+    #
+    SET == 'SET_A' & ISOFORM_PAIR == 'PAIR_01' ~ 'ANK2',
+    SET == 'SET_A' & ISOFORM_PAIR == 'PAIR_03' ~ 'CLASP1_noEx_vs_ExA',
+    SET == 'SET_A' & ISOFORM_PAIR == 'PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+    SET == 'SET_A' & ISOFORM_PAIR == 'PAIR_08' ~ 'NUMB',
+    SET == 'SET_A' & ISOFORM_PAIR == 'PAIR_09' ~ 'SNX2',
+    #
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_01' ~ 'ANK2',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_02' ~ 'Apbb1',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_03' ~ 'CLASP1_noEx_vs_ExA', #
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_03bothEx' ~ 'CLASP1_noEx_vs_ExA+ExB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_03DExVSPanEx' ~ 'CLASP1_noEx_vs_ExB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_03Ex1VsBoth' ~ 'CLASP1_ExA_vs_ExA+ExB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_03ExVsEx' ~ 'CLASP1_ExA_vs_ExB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_05' ~ 'DCTN1',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_06' ~ 'VAV2',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_07' ~ 'FBXW11',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_08' ~ 'NUMB',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_09' ~ 'SNX2',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_10' ~ 'SPAG9',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_RAB5A' ~ 'NegControl',
+    SET == 'SET_1A' & ISOFORM_PAIR == 'PAIR_PosControl' ~ 'PosControl',
+    #
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_01' ~ 'AP1G1',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_02' ~ 'DAAM1',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_03' ~ 'DNM1L',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_04' ~ 'DYNC1LI2',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_05' ~ 'EEA1',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_06' ~ 'KIF3A',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_07' ~ 'ROBO1',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_08' ~ 'SCYL2',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_09' ~ 'SRC',
+    SET == 'SET_B' & ISOFORM_PAIR == 'PAIR_10' ~ 'TNK2',
+    #
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_02' ~ 'CLTA',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_04' ~ 'DNM2',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_05' ~ 'Dnm2',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_06' ~ 'Dnm3',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_07' ~ 'OCRL',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_08' ~ 'PACSIN2',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_09' ~ 'SH3GLB1',
+    SET == 'SET_C' & ISOFORM_PAIR == 'PAIR_10' ~ 'SH3KBP1',
+    #
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_01dex57VS168' ~ '*APP_noEx_vs_ExA', #Ex168nt is ExA, Ex57nt is ExB
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_01wtVS168' ~ '*APP_noEx_vs_ExA+ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_01wtVS57' ~ '*APP_ExA_vs_ExA+ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_02' ~ '*ATXN2',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_03' ~ '*EVI5',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_04' ~ '*OCRL_D/E',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_05' ~ '*PPFIA1',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_06' ~ '*SH3GLB1_D/E',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_07' ~ '*SH3KBP1_D/E',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_08' ~ '*VAV2_noEx_vs_ExA', #ExA (is likely the downstream micro-exon), ExB is upstream micro-exon (I think)
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_08bothEx' ~ '*VAV2_noEx_vs_ExA+ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_08DExVSaltEx' ~ '*VAV2_noEx_vs_ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_08Ex1VsBoth' ~ '*VAV2_ExA_vs_ExA+ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_08ExVsEx' ~ '*VAV2_ExA_vs_ExB',
+    SET == 'SET_D' & ISOFORM_PAIR == 'PAIR_09' ~ '*VAV2_ExB_vs_ExA+ExB'
+  )) %>% 
+  #left_join(., y = SUMMARY_of_all_sample_ratios, by = join_by('SET' == 'SET', 'ISOFORM_PAIR' == 'ISOFORM_PAIR')) %>% 
+  left_join(., y = Exon_descriptions_reduced, by = join_by('Gene_name' == 'Gene_name_Rclassifier')) %>% 
+  #The fusion doesn't work perfectly for genes with multiple events - the line below removes an unwanted duplication of the VAV2 data (NOTE, THIS IS WHAT GIVES RISE TO THE MANY-TO-MANY RELATIONSHIP)
+  dplyr::filter(!c(SET == 'SET_1A' & Gene_name == 'VAV2' & Exon_name_Rclassifier == 'ExB')) %>% 
+  #
+  dplyr::mutate(microexon = case_when( #Hacky way of making all events have microexon, yes/no label
+    word(Gene_name, 1, 1, sep = fixed('_')) == '*APP' ~ FALSE,
+    word(Gene_name, 1, 1, sep = fixed('_')) == '*VAV2' ~ TRUE,
+    word(Gene_name, 1, 1, sep = fixed('_')) == 'CLASP1' ~ TRUE,
+    .default = microexon))
+#
+
+
+#Dataframe w. the gene name SET + PAIR combination
+gene_ids_match <- combined_model_performance_all %>% 
+  dplyr::select(SET, ISOFORM_PAIR, Gene_name, microexon, Exon_length_NT, EVENT_ID_vastDB) %>%
+  unique()
+
+#Dataframe w. n used for classifier and the gene names
+n_used_for_classifier <- combined_model_performance_all %>% 
+  dplyr::select(n, Gene_name) %>% 
+  unique() %>% 
+  dplyr::group_by(Gene_name) %>% 
+  summarize(n = mean(n))
+
+```
+
+```{r creating relative ROC that compares negative transfectant and positive transfectant ROCs, echo = FALSE}
+#Splitting the combined ROC dataset according to transfection status
+#Positive transfectants
+combined_model_performance_all_postrans <- combined_model_performance_all %>% 
+  dplyr::filter(TRANSFECTION_STATUS == 'POSITIVE')
+#Negative transfectants
+combined_model_performance_all_negtrans <- combined_model_performance_all %>% 
+  dplyr::filter(TRANSFECTION_STATUS == 'NEGATIVE')
+
+#Joining positive and negative transfectants in a wide-format
+combined_model_performance_all_posneg_relative <- full_join(x = combined_model_performance_all_postrans, y = combined_model_performance_all_negtrans,
+                                                            by = join_by(SET, ISOFORM_PAIR, Group, Replicate),
+                                                            suffix = c('_postrans', '_negtrans')) %>%
+  # Creating ROC relative column (pos - neg). Can be negative.
+  dplyr::mutate(ROC_posneg_relative = ROC_postrans - ROC_negtrans,
+                tmp_norm_ROC = (ROC_postrans - ROC_negtrans)/(1 - ROC_negtrans),
+                Ceiling_normalised_ROC = if_else(tmp_norm_ROC >= 0, tmp_norm_ROC, (ROC_postrans - ROC_negtrans)/(1 - ROC_postrans)))
+    
+```
+
+### Testing ceiling normalised ROC-AUC distributions for isoform classifiers using boot strap confidence intervals
+
+```{r Function to perform bootstrap confidence interval caluclations, echo = FALSE}
+#' Bootstrap Test for Pre-Normalized ROC Scores with Group Support
+#'
+#' This function calculates bootstrap confidence intervals for normalized ROC scores
+#' that have already been calculated. It supports grouping by a variable (e.g., gene name).
+#'
+#' @param data A data frame containing the normalized scores
+#' @param norm_col Name of the column containing normalized ROC values
+#' @param group_col Name of the column for grouping (e.g., "Gene_name")
+#' @param group_value Value to filter by in the group column (e.g., specific gene name)
+#' @param conf_level Confidence level (default 0.95)
+#' @param n_bootstrap Number of bootstrap iterations (default 2000)
+#' @param one_sided Logical; if TRUE, returns one-sided interval (default TRUE)
+#'
+#' @return A list containing bootstrap statistics and test results
+#'
+#' @examples
+#' # Example with pre-calculated normalized values
+#' data <- data.frame(
+#'   Gene_name = rep(c("Gene1", "Gene2"), each = 50),
+#'   norm_roc = c(rnorm(50, 0.3, 0.1), rnorm(50, -0.1, 0.2))
+#' )
+#' result <- bootstrap_norm_roc_grouped(data, "norm_roc", "Gene_name", "Gene1")
+#' print(result)
+#'
+bootstrap_norm_roc_grouped <- function(data, 
+                                       norm_col = "norm_roc", 
+                                       group_col = NULL,
+                                       group_value = NULL,
+                                       conf_level = 0.95,
+                                       n_bootstrap = 2000,
+                                       one_sided = TRUE) {
+  
+  # Require boot package
+  if (!requireNamespace("boot", quietly = TRUE)) {
+    stop("Please install the 'boot' package: install.packages('boot')")
+  }
+  
+  # Filter data by group if specified
+  if (!is.null(group_col) && !is.null(group_value)) {
+    if (!(group_col %in% colnames(data))) {
+      stop(paste("Group column", group_col, "not found in data"))
+    }
+    data <- data[data[[group_col]] == group_value, ]
+    if (nrow(data) == 0) {
+      stop(paste("No data found for", group_col, "=", group_value))
+    }
+  }
+  
+  # Check if norm_col exists
+  if (!(norm_col %in% colnames(data))) {
+    stop(paste("Normalized score column", norm_col, "not found in data"))
+  }
+  
+  # Extract normalized scores
+  norm_scores <- data[[norm_col]]
+  
+  # Function for bootstrapping
+  boot_func <- function(data, indices) {
+    return(mean(data[indices]))
+  }
+  
+  # Perform bootstrap
+  boot_result <- boot::boot(norm_scores, boot_func, R = n_bootstrap)
+  
+  # Calculate confidence interval
+  if (one_sided) {
+    # One-sided interval (lower bound only)
+    alpha <- 1 - conf_level
+    ci <- boot::boot.ci(boot_result, type = "perc", conf = conf_level)
+    lower_bound <- ci$percent[4]  # Lower bound of percentile interval
+    upper_bound <- Inf
+  } else {
+    # Two-sided interval
+    ci <- boot::boot.ci(boot_result, type = "perc", conf = conf_level)
+    lower_bound <- ci$percent[4]  # Lower bound
+    upper_bound <- ci$percent[5]  # Upper bound
+  }
+  
+  # Determine if zero is in the confidence interval
+  zero_in_ci <- (lower_bound <= 0 && upper_bound >= 0)
+  
+  # Create summary results
+  result <- list(
+    mean = mean(norm_scores),
+    median = median(norm_scores),
+    sd = sd(norm_scores),
+    ci_lower = lower_bound,
+    ci_upper = ifelse(one_sided, Inf, upper_bound),
+    one_sided = one_sided,
+    conf_level = conf_level,
+    zero_in_ci = zero_in_ci,
+    significant = !zero_in_ci,
+    n_iterations = length(norm_scores),
+    n_bootstrap = n_bootstrap,
+    group_col = group_col,
+    group_value = group_value,
+    raw_scores = norm_scores,
+    boot_result = boot_result
+  )
+  
+  return(result)
+}
+
+#' Run Bootstrap Tests for Multiple Groups
+#'
+#' This function runs bootstrap tests for multiple groups and returns results in a data frame
+#'
+#' @param data A data frame containing the normalized scores
+#' @param norm_col Name of the column containing normalized ROC values
+#' @param group_col Name of the column for grouping (e.g., "Gene_name")
+#' @param conf_level Confidence level (default 0.95)
+#' @param n_bootstrap Number of bootstrap iterations (default 2000)
+#' @param one_sided Logical; if TRUE, returns one-sided interval (default TRUE)
+#' @param adjust_method Method for multiple testing correction (default "BH"). Options include 
+#'                     "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none"
+#'
+#' @return A data frame with bootstrap test results for each group, including adjusted p-values
+#'
+#' @examples
+#' # Example with pre-calculated normalized values for multiple genes
+#' data <- data.frame(
+#'   Gene_name = rep(c("Gene1", "Gene2", "Gene3"), each = 50),
+#'   norm_roc = c(rnorm(50, 0.3, 0.1), rnorm(50, -0.1, 0.2), rnorm(50, 0.15, 0.15))
+#' )
+#' results <- bootstrap_multiple_groups(data, "norm_roc", "Gene_name")
+#' print(results)
+#'
+bootstrap_multiple_groups <- function(data, 
+                                      norm_col = "norm_roc", 
+                                      group_col,
+                                      conf_level = 0.95,
+                                      n_bootstrap = 2000,
+                                      one_sided = TRUE,
+                                      adjust_method = "BH") {
+  
+  # Get unique groups
+  groups <- unique(data[[group_col]])
+  
+  # Create empty results data frame
+  results <- data.frame(
+    group = character(),
+    mean = numeric(),
+    median = numeric(),
+    sd = numeric(),
+    ci_lower = numeric(),
+    ci_upper = numeric(),
+    p_value = numeric(),
+    significant = logical(),
+    adj_p_value = numeric(),
+    adj_significant = logical(),
+    n_iterations = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop through groups
+  group_results <- list()
+  p_values <- numeric(length(groups))
+  
+  for (i in seq_along(groups)) {
+    group <- groups[i]
+    # Run bootstrap test
+    boot_result <- bootstrap_norm_roc_grouped(
+      data = data,
+      norm_col = norm_col,
+      group_col = group_col,
+      group_value = group,
+      conf_level = conf_level,
+      n_bootstrap = n_bootstrap,
+      one_sided = one_sided
+    )
+    
+    # Calculate p-value from bootstrap distribution
+    if (one_sided) {
+      # For one-sided test, calculate p-value as proportion of bootstrap values <= 0
+      p_value <- mean(boot_result$boot_result$t <= 0)
+    } else {
+      # For two-sided test, calculate p-value based on whether 0 is in the CI
+      # This is approximate but aligns with the confidence interval approach
+      z_stat <- boot_result$mean / (boot_result$sd / sqrt(boot_result$n_iterations))
+      p_value <- if (boot_result$mean >= 0) 2 * pnorm(-abs(z_stat)) else 2 * pnorm(-abs(z_stat))
+    }
+    
+    p_values[i] <- p_value
+    
+    # Store result
+    group_results[[i]] <- data.frame(
+      group = group,
+      mean = boot_result$mean,
+      median = boot_result$median,
+      sd = boot_result$sd,
+      ci_lower = boot_result$ci_lower,
+      ci_upper = ifelse(one_sided, Inf, boot_result$ci_upper),
+      p_value = p_value,
+      significant = boot_result$significant,
+      n_iterations = boot_result$n_iterations
+    )
+  }
+  
+  # Adjust p-values for multiple testing
+  adj_p_values <- p.adjust(p_values, method = adjust_method)
+  
+  # Combine results
+  results <- do.call(rbind, group_results)
+  results$adj_p_value <- adj_p_values
+  results$adj_significant <- results$adj_p_value < (1 - conf_level)
+  
+  # Return results
+  return(results)
+}
+
+#' Visualize Bootstrap Distribution
+#'
+#' Creates a histogram of bootstrap means with confidence interval
+#'
+#' @param boot_result Result from bootstrap_norm_roc_grouped function
+#' @param bins Number of histogram bins (default 30)
+#'
+#' @return A ggplot2 object
+#'
+plot_bootstrap_dist <- function(boot_result, bins = 30) {
+  # Require ggplot2
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("Please install the 'ggplot2' package: install.packages('ggplot2')")
+  }
+  
+  # Extract bootstrap samples
+  t_values <- boot_result$boot_result$t
+  
+  # Create dataframe for plotting
+  df <- data.frame(value = t_values)
+  
+  # Determine title suffix based on grouping
+  group_suffix <- ""
+  if (!is.null(boot_result$group_col) && !is.null(boot_result$group_value)) {
+    group_suffix <- paste(" for", boot_result$group_col, "=", boot_result$group_value)
+  }
+  
+  # Create plot
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = value)) +
+    ggplot2::geom_histogram(bins = bins, fill = "steelblue", color = "white", alpha = 0.7) +
+    ggplot2::geom_vline(xintercept = boot_result$ci_lower, color = "red", linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = 0, color = "black", linetype = "solid") +
+    ggplot2::labs(
+      title = paste0("Bootstrap Distribution of Normalized ROC Score", group_suffix),
+      subtitle = paste0(
+        ifelse(boot_result$one_sided, "One-sided ", "Two-sided "), 
+        boot_result$conf_level * 100, "% CI: [", 
+        round(boot_result$ci_lower, 4), ", ", 
+        ifelse(boot_result$one_sided, "∞", round(boot_result$ci_upper, 4)), "]"
+      ),
+      x = "Normalized ROC Score",
+      y = "Frequency",
+      caption = paste("Mean:", round(boot_result$mean, 4), 
+                      "| Significant:", boot_result$significant)
+    ) +
+    ggplot2::theme_minimal()
+  
+  return(p)
+}
+
+#' Create Forest Plot of Bootstrap Results
+#'
+#' Creates a forest plot of bootstrap results for multiple groups
+#'
+#' @param results Data frame from bootstrap_multiple_groups function
+#' @param sort_by Column to sort by (default "mean")
+#' @param decreasing Logical; if TRUE, sorts in decreasing order (default TRUE)
+#' @param color_by_significance Logical; if TRUE, colors points by significance (default TRUE)
+#'
+#' @return A ggplot2 object
+#'
+plot_forest <- function(results, 
+                        sort_by = "mean", 
+                        decreasing = TRUE,
+                        color_by_significance = TRUE,
+                        use_adjusted_significance = TRUE) {
+  
+  # Require ggplot2
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("Please install the 'ggplot2' package: install.packages('ggplot2')")
+  }
+  
+  # Sort results
+  results <- results[order(results[[sort_by]], decreasing = decreasing), ]
+  
+  # Make sure group is a factor in the right order for plotting
+  results$group <- factor(results$group, levels = results$group)
+  
+  # Determine which significance column to use
+  sig_col <- if(use_adjusted_significance && "adj_significant" %in% colnames(results)) {
+    "adj_significant"
+  } else {
+    "significant"
+  }
+  
+  # Create plot
+  p <- ggplot2::ggplot(results, ggplot2::aes(x = mean, y = group)) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    ggplot2::geom_errorbarh(ggplot2::aes(xmin = ci_lower, xmax = ci_upper), height = 0.2) +
+    ggplot2::geom_point(ggplot2::aes(color = if(color_by_significance) .data[[sig_col]] else NULL), 
+                        size = 3) +
+    scale_y_discrete(limits = rev(levels(results$group)))+
+    ggplot2::labs(
+      title = paste0("Normalized ROC Scores with Bootstrap Confidence Intervals",
+                     ifelse(use_adjusted_significance && "adj_significant" %in% colnames(results),
+                            "\n(adjusted for multiple testing)", "")),
+      x = "Normalized ROC Score",
+      y = NULL,
+      subtitle = ifelse("adj_p_value" %in% colnames(results), 
+                        paste0("Multiple testing correction: ", 
+                               ifelse(any(results$adj_p_value != results$p_value), "Applied", "None")),
+                        "")
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      axis.text.y = ggplot2::element_text(size = 10),
+      legend.position = "bottom"
+    )
+  
+  # Add color scale if coloring by significance
+  if (color_by_significance) {
+    p <- p + ggplot2::scale_color_manual(
+      values = c("FALSE" = "gray50", "TRUE" = "steelblue"),
+      name = ifelse(use_adjusted_significance && "adj_significant" %in% colnames(results),
+                    "Significant (Adjusted)", "Significant"),
+      labels = c("FALSE" = "No", "TRUE" = "Yes")
+    )
+  }
+  
+  return(p)
+}
+
+# Example usage:
+# # Create sample data with pre-calculated normalized ROC values
+# set.seed(123)
+# data <- data.frame(
+#   Gene_name = rep(c("Gene1", "Gene2", "Gene3", "Gene4"), each = 50),
+#   norm_roc = c(rnorm(50, 0.3, 0.1), 
+#               rnorm(50, -0.1, 0.2), 
+#               rnorm(50, 0.15, 0.15),
+#               rnorm(50, 0.05, 0.1))
+# )
+# 
+# # Test a single gene
+# result_gene1 <- bootstrap_norm_roc_grouped(
+#   data = data,
+#   norm_col = "norm_roc",
+#   group_col = "Gene_name",
+#   group_value = "Gene1"
+# )
+# print(result_gene1)
+# plot1 <- plot_bootstrap_dist(result_gene1)
+# print(plot1)
+# 
+# # Test all genes
+# results_all <- bootstrap_multiple_groups(
+#   data = data,
+#   norm_col = "norm_roc",
+#   group_col = "Gene_name"
+# )
+# print(results_all)
+# 
+# # Create forest plot
+# plot2 <- plot_forest(results_all)
+# print(plot2)
+
+# Remove a specific item from legend
+# If you need to remove an item from a ggplot2 legend (such as color), 
+# you can use the following approach after creating your plot:
+
+# Example:
+# p <- plot_forest(results_all, use_adjusted_significance = TRUE)
+# 
+# # To remove the color legend completely:
+# p <- p + ggplot2::theme(legend.position = "none")
+# 
+# # To keep the legend but remove specific guides:
+# p <- p + ggplot2::guides(color = "none")
+# 
+# # To create a table of results
+# library(knitr)
+# results_table <- results_all[, c("group", "mean", "ci_lower", "ci_upper", 
+#                                 "p_value", "adj_p_value", "adj_significant")]
+# results_table <- results_table[order(results_table$adj_p_value), ]
+# kable(results_table, digits = 4)
+# 
+# print(p)
+```
+
+This code runs the bootstrap confidence interval testing so we can select statisticallyt signfiicant isos
+```{r Calculating bootstrap confidence intervals and creates confidence interval plot, echo=FALSE}
+bootstrap_scores <- bootstrap_multiple_groups(data = combined_model_performance_all_posneg_relative %>% 
+                                    dplyr::filter(Group == 'Isoform'), 
+                          norm_col = "Ceiling_normalised_ROC", 
+                          group_col = 'Gene_name_postrans',
+                          conf_level = 0.99,
+                          n_bootstrap = 2000,
+                          one_sided = TRUE,
+                          adjust_method = "BH") 
+
+#Note, p-values are zero or 1 in most cases - anyhow, we can just indicate significance, I guess.
+
+#Could include this plot as supplementary (?)
+```
+
+
+```{r Loading variable importance classifier data, echo = FALSE}
+#Variable importance
+combined_variable_importance_set_1A <- bind_rows(mget(ls(pattern = 'iso_variable_contrast_importance_SET_1A_PAIR')))
+rm(list = ls(pattern = 'iso_variable_contrast_importance_SET_1A_PAIR'))
+#B
+combined_variable_importance_set_B <- bind_rows(mget(ls(pattern = 'iso_variable_contrast_importance_SET_B_PAIR')))
+rm(list = ls(pattern = 'iso_variable_contrast_importance_SET_B_PAIR'))
+#C
+combined_variable_importance_set_C <- bind_rows(mget(ls(pattern = 'iso_variable_contrast_importance_SET_C_PAIR')))
+rm(list = ls(pattern = 'iso_variable_contrast_importance_SET_C_PAIR'))
+#D
+combined_variable_importance_set_D <- bind_rows(mget(ls(pattern = 'iso_variable_contrast_importance_SET_D_PAIR')))
+rm(list = ls(pattern = 'iso_variable_contrast_importance_SET_D_PAIR'))
+#
+combined_variable_importance_all <- bind_rows(mget(ls(pattern = 'combined_variable_importance_set_'))) %>%
+  left_join(x = ., y = gene_ids_match, by = join_by('SET' == 'SET', 'ISOFORM_PAIR' == 'ISOFORM_PAIR')) 
+
+#
+combined_overall <- combined_variable_importance_all %>% 
+  ungroup() %>% 
+  group_by(Gene_name, TRANSFECTION_STATUS) %>% 
+  summarize('Combined_overall' = sum(Overall_avg),
+            'Combined_overall_neg' = sum(Overall_avg_neg))%>% 
+  dplyr::arrange(Combined_overall)
+
+
+combined_variable_importance_all_w_overall <- combined_variable_importance_all %>% 
+  left_join(., x = combined_overall, by = join_by('Gene_name' == 'Gene_name', 'TRANSFECTION_STATUS' == 'TRANSFECTION_STATUS')) %>%
+  dplyr::mutate('contribution_prop' = (Overall_avg/Combined_overall)*100,
+                'contribution_prop_sd' = (Overall_sd/Combined_overall)*100,
+                'contribution_prop_neg' = (Overall_avg_neg/Combined_overall_neg)*100,
+                'contribution_prop_neg_sd' = (Overall_sd_neg/Combined_overall_neg)*100)
+
+# Combining the variable importance data for negtrans and postrans in a wider format
+# Positive transfectants
+combined_variable_importance_all_w_overall_postrans <- combined_variable_importance_all_w_overall %>% 
+  dplyr::filter(TRANSFECTION_STATUS == 'POSITIVE') %>% 
+  dplyr::select(SET, ISOFORM_PAIR, Gene_name, microexon, Exon_length_NT, EVENT_ID_vastDB, TRANSFECTION_STATUS, Feature,  Rank_median, contribution_prop, contribution_prop_sd,
+                'Rank_median_negcontrol' = Rank_median_neg, 'contribution_prop_negcontrol' = contribution_prop_neg,
+                'contribution_prop_negcontrol_sd' = contribution_prop_neg_sd)
+# Negative transfectants
+combined_variable_importance_all_w_overall_negtrans <- combined_variable_importance_all_w_overall %>% 
+  dplyr::filter(TRANSFECTION_STATUS == 'NEGATIVE') %>% 
+  dplyr::select(SET, ISOFORM_PAIR, Gene_name, microexon, Exon_length_NT, EVENT_ID_vastDB, TRANSFECTION_STATUS, Feature,  Rank_median, contribution_prop, contribution_prop_sd,
+                'Rank_median_negcontrol' = Rank_median_neg, 'contribution_prop_negcontrol' = contribution_prop_neg,
+                'contribution_prop_negcontrol_sd' = contribution_prop_neg_sd)
+
+# Combined positive and negative transfectants
+combined_variable_importance_all_w_overall_posneg <- combined_variable_importance_all_w_overall_postrans %>% 
+  # Joining variable importance for postrans and negtrans
+  dplyr::left_join(x = ., y = combined_variable_importance_all_w_overall_negtrans, by = join_by(SET, ISOFORM_PAIR, Gene_name, microexon, Exon_length_NT, EVENT_ID_vastDB, Feature), suffix = c('_pos', '_neg')) %>% 
+  # Introducing the contribution proportion ratio (postrans/negtrans)
+  dplyr::mutate(contribution_prop_ratio = contribution_prop_pos/contribution_prop_neg,
+                contribution_prop_ratio_negcontrol = contribution_prop_negcontrol_pos/contribution_prop_negcontrol_neg,
+                ratio_times_importance = contribution_prop_ratio * contribution_prop_pos,
+                noteworthy_feature = if_else(ratio_times_importance >= ratio_times_importance_threshold & contribution_prop_ratio > ratio_threshold, TRUE, FALSE)) %>% 
+  # Add p-values from the bootstrapping confidence intervals
+    left_join(x = .,
+            y = bootstrap_scores %>% dplyr::select(group, adj_p_value, adj_significant),
+            by = join_by('Gene_name' == 'group'))
+
+```
+
+```{r xy plot of ratio x contribution prop versus contribution prop positive, echo =FALSE}
+#Importance plot for controls 
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name %in% c('NegControl', 'PosControl')) %>% 
+    ggplot(aes(x = contribution_prop_ratio, y = contribution_prop_ratio * contribution_prop_pos)) +
+    geom_segment(aes(x = ratio_threshold, y = ratio_times_importance_threshold, 
+                     xend = Inf, yend = ratio_times_importance_threshold), color = 'red', linewidth = 0.7) +
+    geom_segment(aes(x = ratio_threshold, y = ratio_times_importance_threshold, 
+                     xend = ratio_threshold, yend = Inf), color = 'red', linewidth = 0.7) +
+    geom_point(aes(fill = noteworthy_feature), shape = 21, size = 5, color = 'black', alpha = 0.8)+
+    scale_y_continuous(transform = 'log2',
+                       limits = c(0.03125,32)) +
+    coord_cartesian(xlim = c(0,7))+
+    xlab('Contribution ratio') +
+    labs(fill = 'Noteworthy\nfeature') +
+    ylab('Feature contribution (%)\nx\nContribution ratio') +
+    ggtitle(paste('Identifying "Noteworthy" features')) +
+    theme_bw(base_size = 16)+
+  facet_wrap(~Gene_name)
+
+```
+
+```{r Function for generating importance plots for single isoforms, echo=FALSE}
+generate_gene_plots <- function(IMPORTANCE_DATA, 
+                                CELL_DATA, 
+                                gene_name,
+                                ratio_threshold = 1, 
+                                ratio_times_importance_threshold = 1,
+                                n = 10) {
+  
+  library(dplyr)
+  library(ggplot2)
+  library(purrr)
+  # Create empty list to store plots
+  plot_list <- list()
+  
+  # Filter data for the specified gene
+  gene_data <- IMPORTANCE_DATA %>% 
+    dplyr::filter(Gene_name == gene_name)
+  
+  # 1. Generate the main importance plot
+  main_plot <- gene_data %>% 
+    ggplot(aes(x = contribution_prop_ratio, y = contribution_prop_ratio * contribution_prop_pos)) +
+    geom_segment(aes(x = ratio_threshold, y = ratio_times_importance_threshold, 
+                     xend = Inf, yend = ratio_times_importance_threshold), color = 'red', linewidth = 0.7) +
+    geom_segment(aes(x = ratio_threshold, y = ratio_times_importance_threshold, 
+                     xend = ratio_threshold, yend = Inf), color = 'red', linewidth = 0.7) +
+    geom_point(aes(fill = noteworthy_feature), shape = 21, size = 4, color = 'black', alpha = 0.8)+
+    scale_y_continuous(transform = 'log2',
+                       limits = c(0.03125,32)) +
+    coord_cartesian(xlim = c(0,7))+
+    xlab('Contribution ratio') +
+    labs(fill = 'Noteworthy\nfeature') +
+    ylab('Feature contribution (%)\nx\nContribution ratio') +
+    ggtitle(paste('"Noteworthy" features for', gene_name)) +
+    theme_bw(base_size = 16) +
+    facet_wrap(~Gene_name)
+  
+  # Add to plot list
+  plot_list$main_importance_plot <- main_plot
+  
+  # 2. Generate bar plot of top n features with highest ratio_times_importance
+  # Filter for noteworthy features and sort by ratio_times_importance
+  top_features_data <- gene_data %>%
+    dplyr::filter(noteworthy_feature == TRUE) %>%
+    dplyr::mutate(ratio_times_importance = contribution_prop_ratio * contribution_prop_pos) %>%
+    dplyr::arrange(desc(ratio_times_importance)) %>%
+    dplyr::slice_head(n = n)
+  
+  # Create the bar plot
+  if (nrow(top_features_data) > 0) {
+    feature_bar_plot <- top_features_data %>%
+      ggplot(aes(x = reorder(Feature, ratio_times_importance), y = ratio_times_importance)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      geom_hline(yintercept = ratio_times_importance_threshold, color = 'red', linewidth = 0.8)+
+      scale_y_continuous(transform = 'log2',
+                       limits = c(1,32)
+                         ) +
+      #coord_cartesian(xlim = c(1,32))+
+      coord_flip() +
+      #     coord_cartesian(ylim = c(1,32))+
+      xlab("Feature") +
+      ylab("Feature contribution (%) x Contribution ratio") +
+      ggtitle(paste("Top", n, "'Noteworthy' features for", gene_name)) +
+      theme_bw(base_size = 16)
+    
+    plot_list$top_features_bar_plot <- feature_bar_plot
+  } else {
+    # Add empty plot with message if no noteworthy features
+    plot_list$top_features_bar_plot <- ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, label = "No noteworthy features found") +
+      theme_bw(base_size = 16)
+  }
+  
+  # 3. Generate dot plots for top features vs MCHERRY intensity
+  # Filter CELL_DATA for the specific gene
+  cell_gene_data <- CELL_DATA %>%
+    dplyr::mutate('Gene_name' = case_when(
+      SET_PAIR == 'SET_1_PAIR_01' ~ 'ANK2',
+      SET_PAIR == 'SET_1_PAIR_03' ~ 'CLASP1_noEx_vs_ExA',
+      SET_PAIR == 'SET_1_PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+      SET_PAIR == 'SET_1_PAIR_08' ~ 'NUMB',
+      SET_PAIR == 'SET_1_PAIR_09' ~ 'SNX2',
+      #
+      SET_PAIR == 'SET_A_PAIR_01' ~ 'ANK2',
+      SET_PAIR == 'SET_A_PAIR_03' ~ 'CLASP1_noEx_vs_ExA',
+      SET_PAIR == 'SET_A_PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+      SET_PAIR == 'SET_A_PAIR_08' ~ 'NUMB',
+      SET_PAIR == 'SET_A_PAIR_09' ~ 'SNX2',
+      #
+      SET_PAIR == 'SET_1A_PAIR_01' ~ 'ANK2',
+      SET_PAIR == 'SET_1A_PAIR_02' ~ 'Apbb1',
+      SET_PAIR == 'SET_1A_PAIR_03' ~ 'CLASP1_noEx_vs_ExA', #
+      SET_PAIR == 'SET_1A_PAIR_03bothEx' ~ 'CLASP1_noEx_vs_ExA+ExB',
+      SET_PAIR == 'SET_1A_PAIR_03DExVSPanEx' ~ 'CLASP1_noEx_vs_ExB',
+      SET_PAIR == 'SET_1A_PAIR_03Ex1VsBoth' ~ 'CLASP1_ExA_vs_ExA+ExB',
+      SET_PAIR == 'SET_1A_PAIR_03ExVsEx' ~ 'CLASP1_ExA_vs_ExB',
+      SET_PAIR == 'SET_1A_PAIR_04' ~ 'CLASP1_ExB_vs_ExA+ExB',
+      SET_PAIR == 'SET_1A_PAIR_05' ~ 'DCTN1',
+      SET_PAIR == 'SET_1A_PAIR_06' ~ 'VAV2',
+      SET_PAIR == 'SET_1A_PAIR_07' ~ 'FBXW11',
+      SET_PAIR == 'SET_1A_PAIR_08' ~ 'NUMB',
+      SET_PAIR == 'SET_1A_PAIR_09' ~ 'SNX2',
+      SET_PAIR == 'SET_1A_PAIR_10' ~ 'SPAG9',
+      SET_PAIR == 'SET_1A_PAIR_RAB5A' ~ 'NegControl',
+      SET_PAIR == 'SET_1A_PAIR_PosControl' ~ 'PosControl',
+      #
+      SET_PAIR == 'SET_B_PAIR_01' ~ 'AP1G1',
+      SET_PAIR == 'SET_B_PAIR_02' ~ 'DAAM1',
+      SET_PAIR == 'SET_B_PAIR_03' ~ 'DNM1L',
+      SET_PAIR == 'SET_B_PAIR_04' ~ 'DYNC1LI2',
+      SET_PAIR == 'SET_B_PAIR_05' ~ 'EEA1',
+      SET_PAIR == 'SET_B_PAIR_06' ~ 'KIF3A',
+      SET_PAIR == 'SET_B_PAIR_07' ~ 'ROBO1',
+      SET_PAIR == 'SET_B_PAIR_08' ~ 'SCYL2',
+      SET_PAIR == 'SET_B_PAIR_09' ~ 'SRC',
+      SET_PAIR == 'SET_B_PAIR_10' ~ 'TNK2',
+      #
+      SET_PAIR == 'SET_C_PAIR_02' ~ 'CLTA',
+      SET_PAIR == 'SET_C_PAIR_04' ~ 'DNM2',
+      SET_PAIR == 'SET_C_PAIR_05' ~ 'Dnm2',
+      SET_PAIR == 'SET_C_PAIR_06' ~ 'Dnm3',
+      SET_PAIR == 'SET_C_PAIR_07' ~ 'OCRL',
+      SET_PAIR == 'SET_C_PAIR_08' ~ 'PACSIN2',
+      SET_PAIR == 'SET_C_PAIR_09' ~ 'SH3GLB1',
+      SET_PAIR == 'SET_C_PAIR_10' ~ 'SH3KBP1',
+      #
+      SET_PAIR == 'SET_D_PAIR_01dex57VS168' ~ '*APP_noEx_vs_ExA', #Ex168nt is ExA, Ex57nt is ExB
+      SET_PAIR == 'SET_D_PAIR_01wtVS168' ~ '*APP_noEx_vs_ExA+ExB',
+      SET_PAIR == 'SET_D_PAIR_01wtVS57' ~ '*APP_ExA_vs_ExA+ExB',
+      SET_PAIR == 'SET_D_PAIR_02' ~ '*ATXN2',
+      SET_PAIR == 'SET_D_PAIR_03' ~ '*EVI5',
+      SET_PAIR == 'SET_D_PAIR_04' ~ '*OCRL_D/E',
+      SET_PAIR == 'SET_D_PAIR_05' ~ '*PPFIA1',
+      SET_PAIR == 'SET_D_PAIR_06' ~ '*SH3GLB1_D/E',
+      SET_PAIR == 'SET_D_PAIR_07' ~ '*SH3KBP1_D/E',
+      SET_PAIR == 'SET_D_PAIR_08' ~ '*VAV2_noEx_vs_ExA', #ExA (is likely the downstream micro-exon), ExB is upstream micro-exon (I think)
+      SET_PAIR == 'SET_D_PAIR_08bothEx' ~ '*VAV2_noEx_vs_ExA+ExB',
+      SET_PAIR == 'SET_D_PAIR_08DExVSaltEx' ~ '*VAV2_noEx_vs_ExB',
+      SET_PAIR == 'SET_D_PAIR_08Ex1VsBoth' ~ '*VAV2_ExA_vs_ExA+ExB',
+      SET_PAIR == 'SET_D_PAIR_08ExVsEx' ~ '*VAV2_ExA_vs_ExB',
+      SET_PAIR == 'SET_D_PAIR_09' ~ '*VAV2_ExB_vs_ExA+ExB'
+    )) %>% 
+    dplyr::filter(Gene_name == gene_name) %>% 
+    dplyr::mutate(Rep_number = as.character(gsub('REP_',"",Experiment_Rep)))
+  
+  # Get the top features
+  top_features <- top_features_data$Feature
+  
+  # Generate a dot plot for each top feature
+  if (length(top_features) > 0) {
+    feature_dot_plots <- map(top_features, function(feature_name) {
+      # Get the ranking of this feature
+      feature_rank <- which(top_features == feature_name)
+      
+      # Check if the feature exists in CELL_DATA
+      if (feature_name %in% colnames(cell_gene_data)) {
+        dot_plot <- cell_gene_data %>%
+          ggplot(aes_string(y = feature_name, x = "Intensity_MeanIntensity_MCHERRY_BACKCORR",
+                            color = "ISOFORM")) +
+          geom_point(alpha = 0.5, size = 3, aes(shape = Rep_number)) +
+          geom_smooth(aes(color = ISOFORM), method = "lm", se = TRUE, linewidth = 1.2, fill = 'black',alpha = 0.8)+
+          scale_x_log10() +
+          scale_shape_discrete(name = "Experimental\nRepeat") +
+          ylab(paste('"Noteworthy" ',feature_rank)) +
+          xlab("mCherry intensity (a.u.)") +
+          ggtitle(paste("No.", feature_rank, "'Noteworthy' feature for", gene_name), 
+                  subtitle = paste("Feature:", feature_name)) +
+          theme_bw(base_size = 16)
+      } else {
+        # Create an empty plot with message if feature doesn't exist in CELL_DATA
+        dot_plot <- ggplot() + 
+          annotate("text", x = 0.5, y = 0.5, 
+                   label = paste("Feature", feature_name, "not found in CELL_DATA")) +
+          theme_bw(base_size = 16) +
+          ggtitle(paste("No.", feature_rank, "feature for", gene_name), 
+                  subtitle = paste("Feature:", feature_name))
+      }
+      
+      return(dot_plot)
+    })
+    
+    # Add feature dot plots to plot list
+    plot_list$feature_dot_plots <- feature_dot_plots
+  } else {
+    plot_list$feature_dot_plots <- list(
+      ggplot() + 
+        annotate("text", x = 0.5, y = 0.5, label = "No features to plot") +
+        theme_bw(base_size = 16)
+    )
+  }
+  
+  return(plot_list)
+}
+
+# Example usage:
+# plot_list <- generate_gene_plots(
+#   IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg,
+#   CELL_DATA = cell_data,
+#   gene_name = "SNX2",
+#   ratio_threshold = 1,
+#   ratio_times_importance_threshold = 1,
+#   n = 5
+# )
+# 
+# # Accessing individual plots
+# plot_list$main_importance_plot
+# plot_list$top_features_bar_plot
+# plot_list$feature_dot_plots[[1]]  # First feature dot plot
+```
+
+## Identifying top features for single isoform pairs
+
+### Loading in single cell measurements
+
+```{r Functions to load in single cell data, echo = FALSE}
+
+#Function for loading in TRANSFECTED CELLS and SUMMARY datasets for each SET.
+Load_transfected_cells_and_summary <- function(SET){
+  setwd(paste0('//srv/scratch/weatheritt/pethan/HeLa_isoform_screen/ALL_CP_MEASUREMENTS_AND_FILTERED_TRANSFECTED_DATASETS'))
+  #setwd(paste0('C:/Users/pethan/OneDrive - garvan.org.au/Documents/Australia_phd/Data/Isoform_imaging_screen_HeLa/ALL_CP_MEASUREMENTS_AND_FILTERED_TRANSFECTED_DATASETS'))
+  
+  Transfected_cell_files <- list.files() %>% 
+    str_subset(pattern = '_TRANSFECTED_CELLS')
+  Transfection_summary_files <- list.files() %>% 
+    str_subset(pattern = '_TRANSFECTION_SUMMARY')
+  
+  load(paste0(str_subset(Transfected_cell_files, pattern = paste0(SET,'_REP_1_TRANSFECTED_CELLS'))))
+  TRANSFECTED_CELLS_REP_1 <- Transfected_cellbodies
+  rm(Transfected_cellbodies)
+  
+  load(paste0(str_subset(Transfected_cell_files, pattern = paste0(SET,'_REP_2_TRANSFECTED_CELLS'))))
+  TRANSFECTED_CELLS_REP_2 <- Transfected_cellbodies
+  rm(Transfected_cellbodies)
+  
+  load(paste0(str_subset(Transfected_cell_files, pattern = paste0(SET,'_REP_3_TRANSFECTED_CELLS'))))
+  TRANSFECTED_CELLS_REP_3 <- Transfected_cellbodies
+  rm(Transfected_cellbodies)
+  
+  Transfected_cells <- bind_rows(TRANSFECTED_CELLS_REP_1,
+                                 TRANSFECTED_CELLS_REP_2,
+                                 TRANSFECTED_CELLS_REP_3)
+  
+  load(paste0(str_subset(Transfection_summary_files, pattern = paste0(SET,'_REP_1_TRANSFECTION_SUMMARY'))))
+  TRANSFECTION_SUMMARY_REP_1 <- Transfection_summary
+  rm(Transfection_summary)
+  
+  load(paste0(str_subset(Transfection_summary_files, pattern = paste0(SET,'_REP_2_TRANSFECTION_SUMMARY'))))
+  TRANSFECTION_SUMMARY_REP_2 <- Transfection_summary
+  rm(Transfection_summary)
+  
+  load(paste0(str_subset(Transfection_summary_files, pattern = paste0(SET,'_REP_3_TRANSFECTION_SUMMARY'))))
+  TRANSFECTION_SUMMARY_REP_3 <- Transfection_summary
+  rm(Transfection_summary)
+  
+  Transfection_summary <- bind_rows(TRANSFECTION_SUMMARY_REP_1,
+                                    TRANSFECTION_SUMMARY_REP_2,
+                                    TRANSFECTION_SUMMARY_REP_3)
+  return(list(Transfected_cells, Transfection_summary))
+}
+#Function for collected summary of REPEAT summaries
+COLLECTED_SUMMARY <- function(DATASET){
+  coll_summ <- DATASET %>%  
+    ungroup() %>% 
+    group_by(Experiment_Set, Metadata_Well) %>% 
+    summarise(Transfected = sum(Transfected_TRUE),
+              n_cells = sum(n_cells),
+              Transfection_rate = round(Transfected/n_cells * 100, digits = 1)) %>%
+    dplyr::mutate('Transfected_REP_1' = DATASET$Transfected_TRUE[DATASET$Experiment_Rep == 'REP_1'],
+                  'Transfected_REP_2' = DATASET$Transfected_TRUE[DATASET$Experiment_Rep == 'REP_2'],
+                  'Transfected_REP_3' = DATASET$Transfected_TRUE[DATASET$Experiment_Rep == 'REP_3'],
+                  'n_cells_REP_1' = DATASET$n_cells[DATASET$Experiment_Rep == 'REP_1'],
+                  'n_cells_REP_2' = DATASET$n_cells[DATASET$Experiment_Rep == 'REP_2'],
+                  'n_cells_REP_3' = DATASET$n_cells[DATASET$Experiment_Rep == 'REP_3'],
+                  'Transfection_rate_REP_1' = round(Transfected_REP_1/n_cells_REP_1 * 100, digits = 1),
+                  'Transfection_rate_REP_2' = round(Transfected_REP_2/n_cells_REP_2 * 100, digits = 1),
+                  'Transfection_rate_REP_3' = round(Transfected_REP_3/n_cells_REP_3 * 100, digits = 1))
+  
+  #coll_summ %>% 
+  #  ungroup() %>% 
+  #  group_by(Experiment_Set) %>% 
+  #
+  return(coll_summ)
+}
+
+remove_non_mcherry_vars <- function(TRANSFECTED_SET, ONLY_TRANSFECTED = FALSE, REDUCE_FEATURES = TRUE, ONLY_NEGTRANSFECTED = FALSE){
+  if(REDUCE_FEATURES == TRUE){
+    Reduced_dataset <- TRANSFECTED_SET %>% 
+      dplyr::select(ImageNumber, ObjectNumber, OBJECT_ID, Metadata_Well, CONTROL,Experiment_Set, Experiment_Rep, SET_PAIR, ISOFORM,TRANSFECTED, 
+                    starts_with('Intensity_') & ends_with('_MCHERRY_BACKCORR'),
+                    starts_with('Correlation_'),
+                    starts_with('Granularity_'), starts_with('RadialDistribution'), starts_with('Texture_'), starts_with('AreaShape_')) %>% 
+      dplyr::select(!c(starts_with('Correlation') & contains('GOLGIN97_AUTOF_CORR'))) %>% 
+      na.omit()
+  }
+  if(REDUCE_FEATURES == FALSE){
+    Reduced_dataset <- TRANSFECTED_SET %>% 
+      dplyr::select(ImageNumber, ObjectNumber, OBJECT_ID, Metadata_Well, CONTROL,Experiment_Set, Experiment_Rep, SET_PAIR, ISOFORM,TRANSFECTED, everything()) %>% 
+      dplyr::select(!c(Experiment_SetRep, ends_with('_BACKGROUND'), Number_Object_Number, Parent_Segmentation)) %>% 
+      na.omit()
+  }
+  if(ONLY_TRANSFECTED == TRUE){
+    Reduced_dataset <- Reduced_dataset %>% 
+      dplyr::filter(TRANSFECTED == TRUE)
+  }
+  if(ONLY_NEGTRANSFECTED == TRUE){
+    Reduced_dataset <- Reduced_dataset %>% 
+      dplyr::filter(TRANSFECTED == FALSE)
+  }
+  return(Reduced_dataset)
+}
+#
+alternative_comparisons_set_1A <- function(DATASET, SET_NAME){
+  alt_pairClasp_altEx <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'DEx' | SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'DEx') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'DEx' ~ 'DEx',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'DEx' ~ 'PanEx'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_03DExVSPanEx'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pairClasp_bothex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'DEx' | SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'WT') %>% 
+    dplyr::mutate(ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'DEx' ~ 'DEx',
+                                      SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'WT' ~ 'Both'),
+                  SET_PAIR = paste0(SET_NAME,'_PAIR_03bothEx'),
+                  SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pairClasp_exvsex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'WT' | SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'DEx') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'WT' ~ 'Ex1',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'DEx' ~ 'PanEx'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_03ExVsEx'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pairClasp_ex1vsboth <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'WT' | SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'WT') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_03') & ISOFORM == 'WT' ~ 'Ex1',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_04') & ISOFORM == 'WT' ~ 'Both'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_03Ex1VsBoth'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  Transfected_only_without_outliers_1A_ALTERNATIVE_COMPARISONS <- DATASET %>% 
+    dplyr::filter(SET_PAIR %in% c('SET_1_PAIR_MCHERRY','SET_1_PAIR_RAB5A', 'SET_A_PAIR_MCHERRY','SET_A_PAIR_RAB5A','SET_1A_PAIR_MCHERRY','SET_1A_PAIR_RAB5A')) %>% 
+    bind_rows(., alt_pairClasp_altEx, alt_pairClasp_bothex, alt_pairClasp_exvsex,alt_pairClasp_ex1vsboth) %>% 
+    na.omit()
+  
+  return(Transfected_only_without_outliers_1A_ALTERNATIVE_COMPARISONS)
+}
+
+#
+alternative_comparisons_set_D <- function(DATASET, SET_NAME){ # DATASET is the transfected cells, SET_NAME is either SET_D or SET_E (Other sets don't have specific pairs)
+  alt_pair01_wt57 <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_01') & ISOFORM %in% c('WT', 'DEx57nt')) %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(ISOFORM == 'WT' ~ 'WT',
+                          ISOFORM == 'DEx57nt' ~ 'DEx'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_01wtVS57'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pair01_wt168 <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_01') & ISOFORM %in% c('WT', 'DEx168nt')) %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(ISOFORM == 'WT' ~ 'WT',
+                          ISOFORM == 'DEx168nt' ~ 'DEx'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_01wtVS168'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pair01_dexdex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_01') & ISOFORM %in% c('DEx57nt', 'DEx168nt')) %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(ISOFORM == 'DEx57nt' ~ 'DEx57nt',
+                          ISOFORM == 'DEx168nt' ~ 'DEx168nt'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_01dex57VS168'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  #
+  alt_pair08altex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'DEx' | SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'DEx') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'DEx' ~ 'DEx',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'DEx' ~ 'AltEx'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_08DExVSaltEx'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  
+  alt_pair08bothex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'DEx' | SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'WT') %>% 
+    dplyr::mutate(ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'DEx' ~ 'DEx',
+                                      SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'WT' ~ 'Both'),
+                  SET_PAIR = paste0(SET_NAME,'_PAIR_08bothEx'),
+                  SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pair08exvsex <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'WT' | SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'DEx') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'WT' ~ 'Ex1',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'DEx' ~ 'Ex2'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_08ExVsEx'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  alt_pair08ex1vsboth <- DATASET %>% 
+    dplyr::filter(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'WT' | SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'WT') %>% 
+    dplyr::mutate(
+      ISOFORM = case_when(SET_PAIR == paste0(SET_NAME,'_PAIR_08') & ISOFORM == 'WT' ~ 'Ex1',
+                          SET_PAIR == paste0(SET_NAME,'_PAIR_09') & ISOFORM == 'WT' ~ 'Both'),
+      SET_PAIR = paste0(SET_NAME,'_PAIR_08Ex1VsBoth'),
+      SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  #Creating dataset with alterantive comparisons (and controls)
+  Transfected_only_without_outliers_D_ALTERNATIVE_COMPARISONS <- DATASET %>% 
+    dplyr::filter(SET_PAIR %in% c('SET_D_PAIR_MCHERRY','SET_D_PAIR_RAB5A', 'SET_E_PAIR_MCHERRY','SET_E_PAIR_RAB5A')) %>% 
+    bind_rows(., alt_pair01_wt57, alt_pair01_wt168, alt_pair01_dexdex, alt_pair08altex, alt_pair08bothex, alt_pair08exvsex, alt_pair08ex1vsboth) %>% 
+    na.omit()
+  
+  return(Transfected_only_without_outliers_D_ALTERNATIVE_COMPARISONS)
+}
+
+#Note, function also removes NAN columns and zero colummns
+Identify_and_remove_outliers <- function(DATASET,
+                                         USE_LOWER_MAX_UPPER_HINGE,
+                                         ONLY_NEGTRANS = FALSE,
+                                         REMOVE_TOP_x_PERCENTILE_NEGATIVE = FALSE,
+                                         TOP_x_PERCENTILE = 0.1,
+                                         REMOVE_SAME_COLS_AS_TRANSFECTED = FALSE,
+                                         TRANSFECTED_DATASET_FOR_COLS_TO_KEEP = NULL
+                                         ){
+  TRANSFECTED_ONLY <- DATASET %>% 
+    dplyr::filter(TRANSFECTED == TRUE)
+  #In the case that only nontransfected cells are in the original dataset, we don't want to remove them by filtering (as we don't have any cells left then)
+  if(ONLY_NEGTRANS == TRUE){
+    TRANSFECTED_ONLY <- DATASET 
+  }
+  if(ONLY_NEGTRANS == TRUE & REMOVE_TOP_x_PERCENTILE_NEGATIVE == TRUE){
+    #Read in dataset
+    TRANSFECTED_ONLY <- DATASET %>% 
+      # Group by the variables of interest
+      group_by(SET_PAIR, Experiment_Rep, ISOFORM) %>%
+      # Arrange within groups by intensity (descending)
+      arrange(desc(Intensity_MeanIntensity_MCHERRY_BACKCORR), .by_group = TRUE) %>%
+      # Calculate the percentile within each group
+      mutate(percentile = row_number()/n()) %>%
+      # Keep only the bottom 80%
+      filter(percentile > TOP_x_PERCENTILE) %>%
+      # Remove the helper column
+      select(-percentile) %>%
+      # Ungroup to remove grouping structure
+      ungroup()
+  }
+  
+  SUMMARY_STATISTICS <- TRANSFECTED_ONLY %>%
+    dplyr::mutate('LOG_INTENSITY' = log10(Intensity_MeanIntensity_MCHERRY_BACKCORR)) %>% 
+    ungroup() %>% 
+    group_by(SET_PAIR, Experiment_Rep, ISOFORM) %>% 
+    summarise(n_cells = length(SET_PAIR),
+              MEAN_INTENSITY = mean(Intensity_MeanIntensity_MCHERRY_BACKCORR),
+              MEDIAN_INTENSITY = mean(Intensity_MedianIntensity_MCHERRY_BACKCORR),
+              SD_INTENSITY = sd(Intensity_MeanIntensity_MCHERRY_BACKCORR),
+              LOG_MEAN_INTENSITY = mean(LOG_INTENSITY),
+              LOG_SD_INTENSITY = sd(LOG_INTENSITY),
+              UPPER_HINGE_IQRx1.5 = quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.75) + 1.5 * (quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.75) - quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.25))) %>% 
+    dplyr::mutate('SET_PAIR_REP_ISOFORM' = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  #Can be used to remove the skew of very bright cells if present in one isoform but not another (simply allows using the highest UPPER hing value from one isoform as the filter for the other isoform)
+  MAX_INTENSITY_CUTOFF_SET_BASED <- SUMMARY_STATISTICS %>%
+    ungroup() %>% 
+    group_by(SET_PAIR, ISOFORM) %>%
+    summarise('MAX_UPPER_HINGE' = max(UPPER_HINGE_IQRx1.5)) %>% 
+    ungroup() %>% 
+    group_by(SET_PAIR) %>% 
+    summarise('LOWER_MAX_UPPER_HINGE' = min(MAX_UPPER_HINGE))
+  #
+  
+  SUMMARY_STATISTICS_OUTLIER_CRITERIUM <- SUMMARY_STATISTICS %>%
+    ungroup() %>% 
+    dplyr::select(SET_PAIR_REP_ISOFORM,
+                  UPPER_HINGE_IQRx1.5)
+  
+  Transfected_cells_outliers_removed <-TRANSFECTED_ONLY %>%
+    dplyr::mutate('SET_PAIR_REP_ISOFORM' = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM),
+                  'LOG_INTENSITY' = log10(Intensity_MeanIntensity_MCHERRY_BACKCORR)) %>% 
+    dplyr::mutate('Intensity_Edge_mean_norm' = Intensity_MeanIntensityEdge_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR,
+                  'Intensity_Edge_max_norm' = Intensity_MeanIntensityEdge_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR,
+                  'Intensity_Max_mean_norm' = Intensity_MaxIntensity_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR,
+                  'Intensity_MassDisp_mean_norm' = Intensity_MassDisplacement_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR,
+                  'Intensity_Std_mean_norm' = Intensity_StdIntensity_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR,
+                  'Intensity_MAD_mean_norm' = Intensity_MADIntensity_MCHERRY_BACKCORR / Intensity_MeanIntensity_MCHERRY_BACKCORR) %>% 
+    dplyr::left_join(x = ., y = SUMMARY_STATISTICS_OUTLIER_CRITERIUM, by = c('SET_PAIR_REP_ISOFORM' = 'SET_PAIR_REP_ISOFORM')) %>%
+    dplyr::filter(Intensity_MeanIntensity_MCHERRY_BACKCORR < UPPER_HINGE_IQRx1.5) %>%
+    dplyr::select(c(1:10,'SET_PAIR_REP_ISOFORM','LOG_INTENSITY','UPPER_HINGE_IQRx1.5', everything()))
+  
+  if(USE_LOWER_MAX_UPPER_HINGE == TRUE){
+    Transfected_cells_outliers_removed <- Transfected_cells_outliers_removed %>% 
+      dplyr::left_join(x = ., y = MAX_INTENSITY_CUTOFF_SET_BASED, by = c('SET_PAIR' = 'SET_PAIR')) %>% 
+      dplyr::filter(Intensity_MeanIntensity_MCHERRY_BACKCORR < LOWER_MAX_UPPER_HINGE)
+  }
+  
+  
+  
+  #Seems to remove columns with NANs and no variance
+  FEATURE_START <- 14
+  SET_PAIRS <- Transfected_cells_outliers_removed %>% 
+    dplyr::filter(!c(word(SET_PAIR, 4,4, sep = fixed('_')) == 'NEGATIVE'),
+                  !c(word(SET_PAIR, 4,4, sep = fixed('_')) == 'MCHERRY')) %>% 
+    dplyr::pull(SET_PAIR) %>% 
+    unique()
+  
+  CONSTANT_COLS <-c()
+  NAN_COLS <- c()
+  FEATURES <- colnames(Transfected_cells_outliers_removed)
+  FEATURE_END <- length(colnames(Transfected_cells_outliers_removed))
+  for(i in SET_PAIRS){
+    PAIR_x_df <- Transfected_cells_outliers_removed %>% 
+      dplyr::filter(SET_PAIR == i)
+    
+    for(j in FEATURE_START:FEATURE_END){
+      constant_value <- length(unique(PAIR_x_df[[j]]))
+      NAN_value <- any(is.na(PAIR_x_df[[j]]))
+      
+      if(constant_value == 1){
+        CONSTANT_COLS <- c(CONSTANT_COLS, j)
+      }
+      if(NAN_value == TRUE){
+        NAN_COLS <- c(NAN_COLS, j)
+      }
+    }
+  }
+  CONSTANT_FEATURES <- FEATURES[CONSTANT_COLS]
+  NAN_FEATURES <- FEATURES[NAN_COLS]
+  FEATURES_TO_REMOVE <- c(unique(CONSTANT_FEATURES), unique(NAN_FEATURES)) #REMOVES 8 VARIABLES FOR SET A (MOSTLY Manders Correlation)
+  TEXT_CONSTANT <- paste0('The variables with CONSTANT values for at least one PAIR are: ', unique(CONSTANT_FEATURES))
+  TEXT_NULL <- paste0('The variables with MISSING values for at least one PAIR are: ', unique(NAN_FEATURES))
+  print(TEXT_CONSTANT)
+  print(TEXT_NULL)
+  
+  
+  Transfected_cells_outliers_removed_REDUCED_COLS <- Transfected_cells_outliers_removed %>% 
+    dplyr::select(!c(all_of(FEATURES_TO_REMOVE))) #%>% 
+  #dplyr::select(!(c(starts_with('Intensity') & ends_with('MCHERRY_BACKCORR'))))
+  
+  if(ONLY_NEGTRANS == TRUE & REMOVE_SAME_COLS_AS_TRANSFECTED == TRUE){
+    Transfected_cells_outliers_removed_REDUCED_COLS <- Transfected_cells_outliers_removed %>%
+      dplyr::select(c(colnames(TRANSFECTED_DATASET_FOR_COLS_TO_KEEP)))
+  }
+  
+  
+  SUMMARY_STATISTICS_OUTLIERS_REMOVED <- Transfected_cells_outliers_removed %>%
+    ungroup() %>% 
+    group_by(SET_PAIR, Experiment_Rep, ISOFORM) %>% 
+    summarise(n_cells = length(SET_PAIR),
+              MEAN_INTENSITY = mean(Intensity_MeanIntensity_MCHERRY_BACKCORR),
+              MEDIAN_INTENSITY = mean(Intensity_MedianIntensity_MCHERRY_BACKCORR),
+              SD_INTENSITY = sd(Intensity_MeanIntensity_MCHERRY_BACKCORR),
+              LOG_MEAN_INTENSITY = mean(LOG_INTENSITY),
+              LOG_SD_INTENSITY = sd(LOG_INTENSITY),
+              UPPER_HINGE_IQRx1.5 = quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.75) + 1.5 * (quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.75) - quantile(Intensity_MeanIntensity_MCHERRY_BACKCORR, probs = 0.25))) %>% 
+    dplyr::mutate('SET_PAIR_REP_ISOFORM' = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM))
+  
+  
+  return(list(Transfected_cells_outliers_removed_REDUCED_COLS, SUMMARY_STATISTICS, SUMMARY_STATISTICS_OUTLIERS_REMOVED))
+}
+
+```
+
+
+
+```{r Loading in and creating filtered cell datasets, echo=FALSE, warning = FALSE}
+# Loading in single cell data
+# SET 1A
+#AGGREGATING SET 1 AND SET A
+SET_1_FOR_FUSION <- Load_transfected_cells_and_summary(SET = 'SET_1')[[1]] %>% 
+  dplyr::filter(!c(SET_PAIR %in% c('SET_1_PAIR_06')))
+#
+SET_A_FOR_FUSION <- Load_transfected_cells_and_summary(SET = 'SET_A')[[1]]
+TRANSFECTED_SET_1Aagg <- bind_rows(SET_1_FOR_FUSION,
+                                   SET_A_FOR_FUSION)
+#SET B
+TRANSFECTED_SET_B <- Load_transfected_cells_and_summary(SET = 'SET_B')[[1]]
+#SET C
+TRANSFECTED_SET_C <- Load_transfected_cells_and_summary(SET = 'SET_C')[[1]]
+#SET D
+TRANSFECTED_SET_D <- Load_transfected_cells_and_summary(SET = 'SET_D')[[1]] %>% 
+  dplyr::filter(!c(SET_PAIR == 'SET_D_PAIR_NegativeGolgin97'))
+
+
+# Reduced transfected datasets
+# Postrans
+Reduced_transfected_B <- remove_non_mcherry_vars(TRANSFECTED_SET_B, ONLY_TRANSFECTED = TRUE, REDUCE_FEATURES = TRUE)
+Reduced_transfected_C <- remove_non_mcherry_vars(TRANSFECTED_SET_C, ONLY_TRANSFECTED = TRUE, REDUCE_FEATURES = TRUE)
+Reduced_transfected_D <- remove_non_mcherry_vars(TRANSFECTED_SET_D, ONLY_TRANSFECTED = TRUE, REDUCE_FEATURES = TRUE)
+Reduced_transfected_1Aagg <- remove_non_mcherry_vars(TRANSFECTED_SET_1Aagg, ONLY_TRANSFECTED = TRUE, REDUCE_FEATURES = TRUE)
+
+# Negtrans
+Reduced_negtrans_B <- remove_non_mcherry_vars(TRANSFECTED_SET_B, ONLY_TRANSFECTED = FALSE, REDUCE_FEATURES = TRUE, ONLY_NEGTRANSFECTED = TRUE)
+Reduced_negtrans_C <- remove_non_mcherry_vars(TRANSFECTED_SET_C, ONLY_TRANSFECTED = FALSE, REDUCE_FEATURES = TRUE, ONLY_NEGTRANSFECTED = TRUE)
+Reduced_negtrans_D <- remove_non_mcherry_vars(TRANSFECTED_SET_D, ONLY_TRANSFECTED = FALSE, REDUCE_FEATURES = TRUE, ONLY_NEGTRANSFECTED = TRUE)
+Reduced_negtrans_1Aagg <- remove_non_mcherry_vars(TRANSFECTED_SET_1Aagg, ONLY_TRANSFECTED = FALSE, REDUCE_FEATURES = TRUE, ONLY_NEGTRANSFECTED = TRUE)
+
+
+
+# Identify and remove outliers
+# Pos trans
+Transfected_only_without_outliers_1A <- Identify_and_remove_outliers(Reduced_transfected_1Aagg, 
+                                                                     USE_LOWER_MAX_UPPER_HINGE = TRUE)[[1]]
+
+Transfected_only_without_outliers_B <- Identify_and_remove_outliers(Reduced_transfected_B, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE)[[1]]
+
+Transfected_only_without_outliers_C <- Identify_and_remove_outliers(Reduced_transfected_C, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE)[[1]]
+
+Transfected_only_without_outliers_D <- Identify_and_remove_outliers(Reduced_transfected_D, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE)[[1]]
+
+# Neg trans
+#Set 1A
+NegTransfected_only_without_outliers_1A <- Identify_and_remove_outliers(Reduced_negtrans_1Aagg, 
+                                                                     USE_LOWER_MAX_UPPER_HINGE = TRUE,
+                                                                     ONLY_NEGTRANS = TRUE,
+                                                                     REMOVE_TOP_x_PERCENTILE_NEGATIVE = TRUE,
+                                                                     TOP_x_PERCENTILE = 0.1,
+                                                                     REMOVE_SAME_COLS_AS_TRANSFECTED = TRUE,
+                                                                     TRANSFECTED_DATASET_FOR_COLS_TO_KEEP = Transfected_only_without_outliers_1A)[[1]]
+#Set B
+NegTransfected_only_without_outliers_B <- Identify_and_remove_outliers(Reduced_negtrans_B, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE,
+                                                                    ONLY_NEGTRANS = TRUE,
+                                                                    REMOVE_TOP_x_PERCENTILE_NEGATIVE = TRUE,
+                                                                    TOP_x_PERCENTILE = 0.1,
+                                                                    REMOVE_SAME_COLS_AS_TRANSFECTED = TRUE,
+                                                                    TRANSFECTED_DATASET_FOR_COLS_TO_KEEP = Transfected_only_without_outliers_B)[[1]]
+#Set C
+NegTransfected_only_without_outliers_C <- Identify_and_remove_outliers(DATASET = Reduced_negtrans_C, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE,
+                                                                    ONLY_NEGTRANS = TRUE,
+                                                                    REMOVE_TOP_x_PERCENTILE_NEGATIVE = TRUE,
+                                                                    TOP_x_PERCENTILE = 0.1,
+                                                                    REMOVE_SAME_COLS_AS_TRANSFECTED = TRUE,
+                                                                    TRANSFECTED_DATASET_FOR_COLS_TO_KEEP = Transfected_only_without_outliers_C)[[1]]
+#Set D
+NegTransfected_only_without_outliers_D <- Identify_and_remove_outliers(Reduced_negtrans_D, 
+                                                                    USE_LOWER_MAX_UPPER_HINGE = TRUE,
+                                                                    ONLY_NEGTRANS = TRUE,
+                                                                    REMOVE_TOP_x_PERCENTILE_NEGATIVE = TRUE,
+                                                                    TOP_x_PERCENTILE = 0.1,
+                                                                    REMOVE_SAME_COLS_AS_TRANSFECTED = TRUE,
+                                                                    TRANSFECTED_DATASET_FOR_COLS_TO_KEEP = Transfected_only_without_outliers_D)[[1]]
+
+#For SET 1 + A FUSION,
+#Note, we collapse the two sets into a collective SET_1A. The information is retained in Reps, as Set1's reps are rep1-3, and SetA's reps are reps 4-6
+Transfected_without_outliers_1A_for_classifier <- Transfected_only_without_outliers_1A %>% 
+  dplyr::mutate(Experiment_Rep = case_when(Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_1' ~ 'REP_1',
+                                           Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_2' ~ 'REP_2',
+                                           Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_3' ~ 'REP_3',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_1' ~ 'REP_4',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_2' ~ 'REP_5',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_3' ~ 'REP_6')) %>% 
+  dplyr::mutate(Experiment_Set = 'SET_1A') %>%
+  dplyr::mutate(SET_PAIR = paste0(Experiment_Set,'_',word(SET_PAIR, start = 3, end = 4, sep = fixed("_"))),
+                SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM)) %>% 
+  dplyr::filter(!c(ISOFORM == 'NEGATIVE')) %>% 
+  na.omit()
+#Negative transfectants set 1 + A fusion
+NegTransfected_without_outliers_1A_for_classifier <- NegTransfected_only_without_outliers_1A %>% 
+  dplyr::mutate(Experiment_Rep = case_when(Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_1' ~ 'REP_1',
+                                           Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_2' ~ 'REP_2',
+                                           Experiment_Set == 'SET_1' & Experiment_Rep == 'REP_3' ~ 'REP_3',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_1' ~ 'REP_4',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_2' ~ 'REP_5',
+                                           Experiment_Set == 'SET_A' & Experiment_Rep == 'REP_3' ~ 'REP_6')) %>% 
+  dplyr::mutate(Experiment_Set = 'SET_1A') %>%
+  dplyr::mutate(SET_PAIR = paste0(Experiment_Set,'_',word(SET_PAIR, start = 3, end = 4, sep = fixed("_"))),
+                SET_PAIR_REP_ISOFORM = paste0(SET_PAIR,'_',Experiment_Rep,'_',ISOFORM)) %>% 
+  dplyr::filter(!c(ISOFORM == 'NEGATIVE')) %>% 
+  na.omit()
+
+
+### Set 1A, alternative comparisons
+#PositiveTransfectants
+Transfected_only_without_outliers_1A_ALTERNATIVE_COMPARISONS <- alternative_comparisons_set_1A(Transfected_without_outliers_1A_for_classifier, SET_NAME = 'SET_1A')%>% 
+  dplyr::mutate(ISOFORM = case_when(ISOFORM == 'WT' ~ 'WT',
+                                    ISOFORM == 'DEx' ~ 'DEx',
+                                    ISOFORM == 'Both' ~ 'WT',
+                                    ISOFORM == 'PanEx' ~ 'WT',
+                                    ISOFORM == 'Ex1' ~ 'DEx',
+                                    ISOFORM == 'MCHERRY' ~ 'MCHERRY'))
+#NegativeTransfectants
+NegTransfected_only_without_outliers_1A_ALTERNATIVE_COMPARISONS <- alternative_comparisons_set_1A(NegTransfected_without_outliers_1A_for_classifier, SET_NAME = 'SET_1A') %>% 
+  dplyr::mutate(ISOFORM = case_when(ISOFORM == 'WT' ~ 'WT',
+                                    ISOFORM == 'DEx' ~ 'DEx',
+                                    ISOFORM == 'Both' ~ 'WT',
+                                    ISOFORM == 'PanEx' ~ 'WT',
+                                    ISOFORM == 'Ex1' ~ 'DEx',
+                                    ISOFORM == 'MCHERRY' ~ 'MCHERRY'))
+
+
+### Set D/E, Alternative comparisons)
+#Set D, positive transfectants
+#View(Transfected_only_without_outliers_D_ALTERNATIVE_COMPARISONS )
+Transfected_only_without_outliers_D_ALTERNATIVE_COMPARISONS <- alternative_comparisons_set_D(DATASET = Transfected_only_without_outliers_D, SET_NAME = 'SET_D') %>% #dplyr::select(SET_PAIR, ISOFORM) %>% distinct()
+  dplyr::mutate(ISOFORM = case_when(
+    SET_PAIR == 'SET_D_PAIR_01dex57VS168' & ISOFORM == 'DEx168nt' ~ 'DEx',
+    SET_PAIR == 'SET_D_PAIR_01dex57VS168' & ISOFORM == 'DEx57nt' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08DExVSaltEx' & ISOFORM == 'AltEx' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08Ex1VsBoth' & ISOFORM == 'Both' ~ 'WT',
+    SET_PAIR == 'SET_D_PAIR_08Ex1VsBoth' & ISOFORM == 'Ex1' ~ 'DEx',
+    #
+    SET_PAIR == 'SET_D_PAIR_08ExVsEx' & ISOFORM == 'Ex1' ~ 'DEx',
+    SET_PAIR == 'SET_D_PAIR_08ExVsEx' & ISOFORM == 'Ex2' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08bothEx' & ISOFORM == 'Both' ~ 'WT',
+    .default = ISOFORM
+  ))
+
+#Set D, negative transfectants
+NegTransfected_only_without_outliers_D_ALTERNATIVE_COMPARISONS <- alternative_comparisons_set_D(DATASET = NegTransfected_only_without_outliers_D, SET_NAME = 'SET_D') %>% 
+  dplyr::mutate(ISOFORM = case_when(
+    SET_PAIR == 'SET_D_PAIR_01dex57VS168' & ISOFORM == 'DEx168' ~ 'DEx',
+    SET_PAIR == 'SET_D_PAIR_01dex57VS168' & ISOFORM == 'DEx57' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08DExVSaltEx' & ISOFORM == 'AltEx' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08Ex1VsBoth' & ISOFORM == 'Both' ~ 'WT',
+    SET_PAIR == 'SET_D_PAIR_08Ex1VsBoth' & ISOFORM == 'Ex1' ~ 'DEx',
+    #
+    SET_PAIR == 'SET_D_PAIR_08ExVsEx' & ISOFORM == 'Ex1' ~ 'DEx',
+    SET_PAIR == 'SET_D_PAIR_08ExVsEx' & ISOFORM == 'Ex2' ~ 'WT',
+    #
+    SET_PAIR == 'SET_D_PAIR_08bothEx' & ISOFORM == 'Both' ~ 'WT',
+    .default = ISOFORM
+  ))
+```
+
+
+#### SNX2 variable importance
+```{r SNX2 variable importance plots, echo=FALSE}
+SNX2_var_import_plots <- generate_gene_plots(IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg, 
+                                CELL_DATA = Transfected_without_outliers_1A_for_classifier, 
+                                gene_name = 'SNX2',
+                                ratio_threshold = ratio_threshold, 
+                                ratio_times_importance_threshold = ratio_times_importance_threshold,
+                                n = 5)
+SNX2_var_import_plots$main_importance_plot
+SNX2_var_import_plots$top_features_bar_plot
+SNX2_var_import_plots$feature_dot_plots[[1]]
+SNX2_var_import_plots$feature_dot_plots[[2]]
+SNX2_var_import_plots$feature_dot_plots[[3]]
+
+```
+#### ANK2 variable importance
+```{r ANK2 variable importance plots, echo=FALSE}
+ANK2_var_import_plots <- generate_gene_plots(IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg, 
+                                CELL_DATA = Transfected_without_outliers_1A_for_classifier, 
+                                gene_name = 'ANK2',
+                                ratio_threshold = ratio_threshold, 
+                                ratio_times_importance_threshold = ratio_times_importance_threshold,
+                                n = 5)
+ANK2_var_import_plots$main_importance_plot
+ANK2_var_import_plots$top_features_bar_plot
+ANK2_var_import_plots$feature_dot_plots[[1]]
+ANK2_var_import_plots$feature_dot_plots[[2]]
+ANK2_var_import_plots$feature_dot_plots[[3]]
+```
+#### NUMB variable importance
+```{r NUMB variable importance plots, echo=FALSE}
+NUMB_var_import_plots <- generate_gene_plots(IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg, 
+                                CELL_DATA = Transfected_without_outliers_1A_for_classifier, 
+                                gene_name = 'NUMB',
+                                ratio_threshold = ratio_threshold, 
+                                ratio_times_importance_threshold = ratio_times_importance_threshold,
+                                n = 1)
+NUMB_var_import_plots$main_importance_plot
+NUMB_var_import_plots$top_features_bar_plot
+NUMB_var_import_plots$feature_dot_plots[[1]]
+#NUMB_var_import_plots$feature_dot_plots[[2]]
+#NUMB_var_import_plots$feature_dot_plots[[3]]
+
+
+
+```
+#### OCRL variable importance
+```{r OCRL variable importance plots, echo=FALSE}
+OCRL_var_import_plots <- generate_gene_plots(IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg, 
+                                CELL_DATA = Transfected_only_without_outliers_C, 
+                                gene_name = 'OCRL',
+                                ratio_threshold = ratio_threshold, 
+                                ratio_times_importance_threshold = ratio_times_importance_threshold,
+                                n = 5)
+OCRL_var_import_plots$main_importance_plot
+OCRL_var_import_plots$top_features_bar_plot
+OCRL_var_import_plots$feature_dot_plots[[1]]
+OCRL_var_import_plots$feature_dot_plots[[2]]
+OCRL_var_import_plots$feature_dot_plots[[3]]
+```
+#### FBXW11 variable importance
+```{r FBXW11 variable importance plots, echo=FALSE}
+FBXW11_var_import_plots <- generate_gene_plots(IMPORTANCE_DATA = combined_variable_importance_all_w_overall_posneg, 
+                                CELL_DATA = Transfected_without_outliers_1A_for_classifier, 
+                                gene_name = 'FBXW11',
+                                ratio_threshold = ratio_threshold, 
+                                ratio_times_importance_threshold = ratio_times_importance_threshold,
+                                n = 5)
+FBXW11_var_import_plots$main_importance_plot
+FBXW11_var_import_plots$top_features_bar_plot
+FBXW11_var_import_plots$feature_dot_plots[[1]]
+FBXW11_var_import_plots$feature_dot_plots[[2]]
+FBXW11_var_import_plots$feature_dot_plots[[3]]
+```
+
+
+## Recurring important features
+```{r ranking features and some numbers, echo=FALSE}
+# Number of isoform classifiers that are statistically significant (bootstrap) - exlcuding controls
+Isoform_classifiers_w_diff_isoforms <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::pull(Gene_name)
+
+# Total number of features
+Total_features_used_for_classification <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  dplyr::pull(Feature) %>% 
+  unique()
+
+# Feature classes df
+Feature_classes <- bind_cols('Feature' = Total_features_used_for_classification) %>%
+  dplyr::mutate(major_class = word(Feature, start = 1, end = 1, sep = fixed('_'))) %>%
+  dplyr::mutate(minor_class = word(Feature, start = 1, end = 2, sep = fixed('_')))
+
+# Vector of the major feature claseses
+Major_feature_classes <- Feature_classes %>% 
+  dplyr::pull(major_class) %>% 
+  unique()
+
+# Vector of the minor feature claseses
+Minor_feature_classes <- Feature_classes %>% 
+  dplyr::pull(minor_class) %>% 
+  unique()
+
+# Feature order based on how many times they are recurring as noteworthy
+Represented_feature_classes <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  dplyr::mutate(major_class = word(Feature, start = 1, end = 1, sep = fixed('_'))) %>% 
+  dplyr::mutate(minor_class = word(Feature, start = 1, end = 2, sep = fixed('_')))
+
+#Creating dataframe of the minor feature classes that are noteworthy (only doing for minor as all major ones are represented)
+Represented_minor_classes <- Represented_feature_classes$minor_class %>% 
+  unique()
+
+
+###USE THE FEATURE_CLASSES DF TO JUST BRIEFLY DETERMINE HOW LARGE A PROPORTION OF THE SUB_CLASSES IN EACH MAJOR CLASS ARE Represented_feature_classes ###
+
+# Recurring features order
+Recurring_features_order <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  #Arrange with lowest on top
+  dplyr::arrange(n) %>% 
+  dplyr::pull(Feature)
+
+
+# Summary of these numbers
+print(paste('The number of features used for clasisfication are:', length(Total_features_used_for_classification)))
+print(paste(length(Recurring_features_order), 'are noteworthy in at least one of the:',length(unique(Isoform_classifiers_w_diff_isoforms)),'statistically siginficant (boostrap confidence intervals) classifiers.'))
+print(paste('That is',(length(Recurring_features_order)/length(Total_features_used_for_classification))*100,'%.'))
+print(paste('We used features within 6 major feature groups for the classifiers. These were:',Major_feature_classes))
+print(paste('All major classes were represented as a noteworthy feature at least once',all(Major_feature_classes %in% Represented_feature_classes$major_class)))
+print(paste('We used',length(Minor_feature_classes),' minor features classes the mmajor clases for the classifiers.'))
+print(paste('All minor classes were represented as a noteworthy feature at least once',all(Minor_feature_classes %in% Represented_feature_classes$minor_class)))
+print(paste(length(Represented_minor_classes),'were represented as a noteworthy feature at least one.'))
+print(paste('That is',(length(Represented_minor_classes)/length(Minor_feature_classes))*100,'% of minor classes.'))
+```
+### USE THE FEATURE_CLASSES DF TO JUST BRIEFLY DETERMINE HOW LARGE A PROPORTION OF THE SUB_CLASSES IN EACH MAJOR CLASS ARE Represented_feature_classes
+
+```{r Plot of recurring features, echo = FALSE}
+# How many of the features are used for classification?
+bind_cols(n_features = c((length(Total_features_used_for_classification) - length(unique(Represented_feature_classes$Feature))),
+                         length(unique(Represented_feature_classes$Feature))),
+          noteworthy_feature = c(FALSE, TRUE)) %>% 
+  ggplot(aes(x = noteworthy_feature, y = n_features))+
+  geom_col()+
+  labs(title = 'Features "Noteworthy" at least 1 time',
+       y = 'Count (n)',
+       x = 'Noteworthy')+
+  theme_bw(base_size = 16)
+
+
+# Count of feature represenation in major categories. Occurs at least 1
+Represented_feature_classes %>% 
+  ungroup() %>% 
+  # Counts the number of times each feature occur
+  dplyr::select(Feature, major_class) %>% 
+  distinct() %>% 
+  group_by(major_class) %>%
+  summarize(n_features_noteworthy = n()) %>% 
+  # The plot
+  ggplot(aes(y = fct_reorder(major_class, n_features_noteworthy), x = n_features_noteworthy))+
+  geom_col()+
+  labs(title = 'Number of "Noteworthy" features in each major category',
+       subtitle = 'Occurs at least 1 time',
+       y = 'Main Feature groups',
+       x = 'Count')+
+  theme_bw(base_size = 16)
+
+
+
+
+# How large a proportion of the subclasses within a major class are used?
+# Counting the degree to which minor from each major class are represented
+Represented_feature_classes %>% 
+  ungroup() %>% 
+  # Counts the number of times each feature occur
+  group_by(Feature, major_class, minor_class) %>%
+  summarize(n_feature_recurrence = n()) %>% 
+  dplyr::filter(n_feature_recurrence >= 1) %>% 
+  # Counts how many of the minor classes are represented 
+  ungroup() %>% 
+  dplyr::select(major_class, minor_class) %>%
+  distinct() %>% 
+  group_by(major_class) %>% 
+  summarize(n_occurence = n()) %>% 
+  #
+  dplyr::right_join(x = ., y = Feature_classes %>% 
+                      ungroup() %>% 
+                      dplyr::select(major_class, minor_class) %>% 
+                      distinct() %>% 
+                      group_by(major_class) %>% 
+                      summarize(n_total = n()),
+                    by = join_by(major_class)
+) %>% 
+  dplyr::mutate(n_occurence = if_else(is.na(n_occurence),0,n_occurence),
+                proportion_represented = n_occurence/n_total) %>% 
+  dplyr::arrange(proportion_represented) %>% 
+  ungroup() %>% 
+  # The plot
+  ggplot(aes(y = fct_reorder(major_class,proportion_represented), x = proportion_represented))+
+  geom_col()+
+  geom_text(aes(x = 0.9, label = paste(n_occurence,'/',n_total)))+
+  coord_cartesian(xlim = c(0,1))+
+  labs(title = 'Proportion of sub-feature groups occuring as "Noteworthy"',
+       subtitle = 'Occurs at least 1 time',
+       y = 'Main Feature groups',
+       x = 'Proportion of subgroups occuring')+
+  theme_bw(base_size = 16)
+
+
+
+# How often are the noteworthy features used?
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  dplyr::mutate(Feature = factor(Feature, levels = Recurring_features_order)) %>% 
+  ggplot(aes(x = n))+
+  geom_histogram(bins = 4)+
+    labs(title = 'Recurrence of "Noteworthy" features',
+          y = 'Count (n)',
+          x = 'No. of occurences')+
+  theme_bw(base_size = 16)
+
+
+# Count plot of all features and their recurrence that shows feature name
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  dplyr::mutate(Feature = factor(Feature, levels = Recurring_features_order)) %>% 
+  ggplot(aes(y = Feature, x = percent_of_all))+
+  geom_col()+
+  labs(title = 'Features in classifiers',
+         subtitle = '"Noteworthy" in at least 1 classifier detecting different',
+          y = 'Feature',
+          x = 'Proportion of classifiers')+
+  theme_bw(base_size = 16)
+
+
+#For most recurring features (e.g. the ones that are found in at least 3 (lower) or 4 of stat isoform classifiers, we can examine)
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  dplyr::mutate(Feature = factor(Feature, levels = Recurring_features_order)) %>% 
+  dplyr::filter(n >= 2) %>% 
+  ggplot(aes(y = Feature, x = percent_of_all))+
+  geom_col()+
+  labs(title = 'Features in classifiers',
+         subtitle = '"Noteworthy" in at least 2 classifiers detecting different',
+          y = 'Feature',
+          x = 'Proportion of classifiers')+
+  theme_bw(base_size = 16)
+
+
+# Count of feature represenation in major categories. Occurs at least 2x
+Represented_feature_classes %>% 
+  ungroup() %>% 
+  # Counts the number of times each feature occur
+  group_by(Feature, major_class, minor_class) %>%
+  summarize(n_feature_recurrence = n()) %>% 
+  dplyr::filter(n_feature_recurrence >= 2) %>% 
+  # Counts how many of the minor classes are represented 
+  ungroup() %>% 
+  dplyr::select(Feature, major_class) %>%
+  distinct() %>% 
+  group_by(major_class) %>% 
+  summarize(n_features_noteworthy = n()) %>% 
+  # The plot
+  ggplot(aes(y = fct_reorder(major_class, n_features_noteworthy), x = n_features_noteworthy))+
+  geom_col()+
+  labs(title = 'Number of "Noteworthy" features in each major category',
+       subtitle = 'Occurs at least 2 time',
+       y = 'Main Feature groups',
+       x = 'Count (n)')+
+  theme_bw(base_size = 16)
+  
+# How large a proportion of the subclasses within a major class are used?
+# Counting the degree to which minor from each major class are represented
+Represented_feature_classes %>% 
+  ungroup() %>% 
+  # Counts the number of times each feature occur
+  group_by(Feature, major_class, minor_class) %>%
+  summarize(n_feature_recurrence = n()) %>% 
+  dplyr::filter(n_feature_recurrence >= 2) %>% 
+  # Counts how many of the minor classes are represented 
+  ungroup() %>% 
+  dplyr::select(major_class, minor_class) %>%
+  distinct() %>% 
+  group_by(major_class) %>% 
+  summarize(n_occurence = n()) %>% 
+  #
+  dplyr::right_join(x = ., y = Feature_classes %>% 
+                      ungroup() %>% 
+                      dplyr::select(major_class, minor_class) %>% 
+                      distinct() %>% 
+                      group_by(major_class) %>% 
+                      summarize(n_total = n()),
+                    by = join_by(major_class)
+) %>% 
+  dplyr::mutate(n_occurence = if_else(is.na(n_occurence),0,n_occurence),
+                proportion_represented = n_occurence/n_total) %>% 
+  dplyr::arrange(proportion_represented) %>% 
+  ungroup() %>% 
+  # The plot
+  ggplot(aes(y = fct_reorder(major_class,proportion_represented), x = proportion_represented))+
+  geom_col()+
+  geom_text(aes(x = 0.9, label = paste(n_occurence,'/',n_total)), size = 5)+
+  coord_cartesian(xlim = c(0,1))+
+  labs(title = 'Proportion of sub-feature groups occuring as "Noteworthy"',
+       subtitle = 'Occurs at least 2 times',
+       y = 'Main Feature groups',
+       x = 'Proportion of subgroups occuring')+
+  theme_bw(base_size = 16)
+
+
+# Percent of features that remain noteworthy (when required to occur at least 2x)
+Represented_feature_classes %>% 
+  ungroup() %>% 
+  # Counts the number of times each feature occur
+  group_by(Feature, major_class, minor_class) %>%
+  summarize(n_feature_recurrence = n()) %>% 
+  dplyr::filter(n_feature_recurrence >= 2) %>% 
+  # Counts how many of the minor classes are represented 
+  ungroup() %>% 
+  dplyr::select(Feature, major_class) %>%
+  distinct() %>% 
+  group_by(major_class) %>% 
+  summarize(n_occurence_more_than_1x = n()) %>% 
+  #
+  dplyr::right_join(x = ., y = Represented_feature_classes %>% 
+                      ungroup() %>% 
+                      dplyr::select(Feature, major_class) %>%
+                      distinct() %>% 
+                      group_by(major_class) %>% 
+                      summarize(n_occurence_1x = n()),
+                    by = join_by(major_class)) %>% 
+  dplyr::mutate(n_occurence_more_than_1x = if_else(is.na(n_occurence_more_than_1x),0, n_occurence_more_than_1x),
+                proportion_represented = n_occurence_more_than_1x/n_occurence_1x) %>% 
+  dplyr::arrange(proportion_represented) %>% 
+  ungroup() %>% 
+  # The plot
+  ggplot(aes(y = fct_reorder(major_class,proportion_represented), x = proportion_represented))+
+  geom_col()+
+  geom_text(aes(x = 0.9, label = paste(n_occurence_more_than_1x,'/',n_occurence_1x)), size = 5)+
+  coord_cartesian(xlim = c(0,1))+
+  labs(title = 'Proportion of sub-feature groups occuring as "Noteworthy"',
+       subtitle = 'Occurs at least 2 times',
+       y = 'Main Feature groups',
+       x = 'Proportion of subgroups occuring')+
+  theme_bw(base_size = 16)
+```
+
+### Plot of importance metric for the recurring features (occuring at least 3 or 4 times)
+```{r Importance metric ratio x score plotted for each recurring feature with linerange and mean, echo=FALSE}
+### 3x recurring
+# Recurring features order, occurence at least 3x
+Recurring_features_order_n3 <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  #Arrange with lowest on top
+  dplyr::ungroup() %>% 
+  dplyr::filter(n >= 3) %>% 
+  dplyr::arrange(n) %>% 
+  dplyr::pull(Feature)
+
+#Mean importance metric for 3 recurring
+Feature_order_importance_metric_n3 <- combined_variable_importance_all_w_overall_posneg %>% 
+  ungroup() %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n3)) %>%
+  group_by(Feature) %>% 
+  summarise(mean_importance = mean(ratio_times_importance)) %>% 
+  ungroup() %>% 
+  dplyr::arrange(mean_importance) %>% 
+  dplyr::pull(Feature)
+
+#
+Feature_summary_n3 <- combined_variable_importance_all_w_overall_posneg %>% 
+  ungroup() %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n3)) %>%
+  group_by(Feature) %>% 
+  summarise(n_occurence = n(),
+            min_importance = min(ratio_times_importance),
+            max_importance = max(ratio_times_importance),
+            mean_importance = mean(ratio_times_importance)) %>% 
+  ungroup() %>% 
+  dplyr::mutate(Feature = factor(Feature, levels = Feature_order_importance_metric_n3))
+
+# Plot of importance metric (ratio x score) for recurring features
+#View(combined_variable_importance_all_w_overall_posneg )
+
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n3)) %>%
+  dplyr::mutate(Feature = factor(Feature, levels = Feature_order_importance_metric_n3)) %>% 
+  ggplot(aes(x = ratio_times_importance, y = Feature))+
+  geom_linerange(data = Feature_summary_n3, aes(xmin = min_importance, x = mean_importance, xmax = max_importance), alpha = 0.5)+
+  geom_point(aes(fill = Gene_name), shape = 21, size = 4.5, color = 'black', alpha = 0.9, position = position_jitter(width = 0, height = 0.25))+
+  geom_point(data = Feature_summary_n3, aes(x = mean_importance), shape = 'l', size = 6, color = 'black', alpha = 0.75)+
+  geom_text(data = Feature_summary_n3, aes(x = 64, label = paste('n=',n_occurence)), size = 4.5)+
+  geom_vline(xintercept = ratio_times_importance_threshold, color = 'red', linewidth = 1)+
+  theme_bw(base_size = 16)+
+  scale_x_continuous(transform = 'log2')+
+  coord_cartesian(xlim = c(1,100))+
+  labs(title = 'Importance of "Noteworthy" features',
+       subtitle = 'Occurs at least 3 times',
+       y = 'Feature',
+       x = 'Feature contribution (%) x Contribution ratio',
+       fill = 'Gene with isoforms')+
+  theme_bw(base_size = 16)
+
+
+
+### 4x recurring
+# Recurring features order, occurence at least 4x
+Recurring_features_order_n2 <- combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarize(n = n(),
+            percent_of_all = n/length(unique(Isoform_classifiers_w_diff_isoforms))) %>% 
+  #Arrange with lowest on top
+  dplyr::ungroup() %>% 
+  dplyr::filter(n >= 2) %>% 
+  dplyr::arrange(n) %>% 
+  dplyr::pull(Feature)
+
+#Mean importance metric for4 recurring
+Feature_order_importance_metric_n2 <- combined_variable_importance_all_w_overall_posneg %>% 
+  ungroup() %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n2)) %>%
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarise(mean_importance = mean(ratio_times_importance)) %>% 
+  ungroup() %>% 
+  dplyr::arrange(mean_importance) %>% 
+  dplyr::pull(Feature)
+
+# Feature summaries with recurrence at least 4x
+Feature_summary_n2 <- combined_variable_importance_all_w_overall_posneg %>% 
+  ungroup() %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n2)) %>%
+    dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  group_by(Feature) %>% 
+  summarise(n_occurence = n(),
+            min_importance = min(ratio_times_importance),
+            max_importance = max(ratio_times_importance),
+            mean_importance = mean(ratio_times_importance)) %>% 
+  ungroup() %>% 
+  dplyr::mutate(Feature = factor(Feature, levels = Feature_order_importance_metric_n2))
+
+
+# Plot of importance metric (ratio x score) for recurring features, at least 4x recurrence
+combined_variable_importance_all_w_overall_posneg %>% 
+  dplyr::filter(Gene_name != 'PosControl') %>% 
+  dplyr::filter(adj_significant == TRUE) %>% 
+  dplyr::filter(noteworthy_feature == TRUE) %>% 
+  dplyr::filter(Feature %in% c(Recurring_features_order_n2)) %>%
+  dplyr::mutate(Feature = factor(Feature, levels = Feature_order_importance_metric_n2)) %>% 
+  # Removes intensity edge max norm, as I accidentally specified it to be the same as intensity edge mean norm (it has been like that for classifiers as well, but no point in doing everything again)
+  dplyr::filter(!Feature == 'Intensity_Edge_max_norm') %>% 
+  #
+  ggplot(aes(x = ratio_times_importance, y = Feature))+
+  geom_linerange(data = Feature_summary_n2 %>% 
+                     dplyr::filter(!Feature == 'Intensity_Edge_max_norm'), aes(xmin = min_importance, x = mean_importance, xmax = max_importance), alpha = 0.5)+
+  geom_point(aes(fill = Gene_name), shape = 21, size = 4, color = 'black', alpha = 0.9, position = position_jitter(width = 0, height = 0.25))+
+  geom_point(data = Feature_summary_n2 %>% 
+                     dplyr::filter(!Feature == 'Intensity_Edge_max_norm'), aes(x = mean_importance), shape = 'l', size = 6, color = 'black', alpha = 0.75)+
+  geom_text(data = Feature_summary_n2 %>% 
+                     dplyr::filter(!Feature == 'Intensity_Edge_max_norm'), aes(x = 64, label = paste('n=',n_occurence)), size = 4.5)+
+  geom_vline(xintercept = ratio_times_importance_threshold, color = 'red', linewidth = 1)+
+  theme_bw(base_size = 16)+
+  scale_x_continuous(transform = 'log2')+
+  coord_cartesian(xlim = c(1,100))+
+  labs(title = 'Importance of "Noteworthy" features',
+       subtitle = 'Occurs at least 2 times',
+       y = 'Feature',
+       x = 'Feature contribution (%) x Contribution ratio',
+       fill = 'Gene with isoforms')+
+  theme_bw(base_size = 16)
+
+```
+

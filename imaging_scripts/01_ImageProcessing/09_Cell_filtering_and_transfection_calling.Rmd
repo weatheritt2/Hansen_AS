@@ -1,0 +1,604 @@
+---
+title: "09_Cell_filtering_and_transfection_calling"
+author: "Peter Kjer Hansen"
+date: "2025-03-18"
+output:
+  html_document:
+    fig_width: 12
+---
+This .rmd is used to import the cell measurements obtained from cell profiler and filter the cells and images to remove cells that are mis-segmented or dividing. It then enables exploration of the mCherry levels in the non-transfected cell populations which can be used to determine a transfection threshold (using mCherry mean intensity and upper quartile) that defines the mCherry-positive cells. Using the transfection threshold, we can then define whether cells are transfected or not, which is used for subsequent analysis.
+The filter cell dataset with assigned transfection status can be saved as a new .csv file that is then used for down-stream classifier-based analysis OR other types of analysis such as principal compoonent analysis used for the SNX2 mutant constructs.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Required packages
+library(tidyverse)
+library(readxl)
+```
+
+```{r Defining working directories and file names, echo = FALSE}
+### Working directories for different reps
+# Rep1
+working_directory_rep1 <- 'INSERT DIRECTORY'
+# Rep 2
+working_directory_rep2 <- 'INSERT DIRECTORY'
+# Rep 3
+working_directory_rep3 <- 'INSERT DIRECTORY'
+
+### File names
+# Cellbody
+cellbody_file <- 'INSERT file name of .csv containing cellprofiler measurements from cellbody segmentations'
+# Cellbody not on border
+cellbody_not_on_border_file <- 'INSERT file name of .csv containing cellprofiler measurements from cellbody not on border'
+# Nuclues
+nuclei_file <- 'INSERT file name of .csv containing cellprofiler measurements from nucleus segmentation'
+# Cytoplasm
+cytoplasm_file <- 'INSERT file name of .csv containing cellprofiler measurements from cytoplasm segmentation'
+# Metadata file  
+metadata_file <- 'INSERT file name of .csv containing image-level information'
+
+### Excel sheet describing images to manually remove
+# Path
+fovs_to_remove_file <- 'INSERT PATH TO .xlsx that describes what images to remove based on artifacts (fibres, out-of-focus, etc.)'
+# Sheet
+sheet_name <- 'INSERT SHEET NAME'
+```
+
+
+```{r Filter function ONE For filtering cells based on classification and touching border, echo = FALSE}
+cell_classification <- function(DATASET){
+  cell_classification <- DATASET %>% 
+    dplyr::select(ImageNumber, ObjectNumber, Children_Cellbodies_NOT_ON_BORDER_Count, Classify_DYING_DIVIDING_CELL, Classify_PROPER_CELL) %>% 
+    dplyr::mutate('Cell_classification' = case_when(
+      Classify_DYING_DIVIDING_CELL == 1 ~ 'DYING_DIVIDING',
+      Classify_PROPER_CELL == 1 ~ 'PROPER'),
+      Touching_border = if_else(Children_Cellbodies_NOT_ON_BORDER_Count == 1, FALSE, TRUE)) %>% 
+    dplyr::select(ImageNumber, ObjectNumber, Cell_classification, Touching_border) 
+  NEW_DATASET <- dplyr::left_join(x = DATASET, y = cell_classification, by = c("ImageNumber","ObjectNumber")) %>%
+    dplyr::filter(Touching_border == FALSE) %>% 
+    dplyr::filter(Cell_classification == 'PROPER') %>%
+    dplyr::select(!c(Classify_DYING_DIVIDING_CELL, Classify_PROPER_CELL)) %>% 
+    dplyr::select(!ends_with('_Object_prediction')) #NOTE, THIS LINE OF CODE CAN BE USED UPON IMPORT AND THAT IS LIKELY PREFERABLE
+  return(NEW_DATASET)
+}
+```
+
+```{r Filter function TWO For removing cells based on degree of touching, echo = FALSE}
+#Remove cells with PercentTouching of other cellbodies above a certain limit, e.g. 80%. Takes dataset and cutoff as inputs
+remove_high_touchpercent_cells <- function(DATASET,TOUCH_CUTOFF){
+  NEW_DATASET <- DATASET %>% 
+    dplyr::filter(Neighbors_PercentTouching_Adjacent < TOUCH_CUTOFF)
+  return(NEW_DATASET)
+}
+```
+
+```{r Filter function THREE For removing cells based on nuclei count and touching nuclei, echo=FALSE}
+#Filters cellbodies based on containing multiple nuclei
+#AND based on whether nuclei from separate cells are within 10 pixels from one another (which may also indicate multiple nuclei + mis-segment)
+#It is basically are an expansion of the single nucleus per cellbody filter. Use either one or the other. (can be used sequentially but 'keep one nuclei' is done by this function as well)
+remove_cells_with_touching_nuclei <- function(PARENT_DATASET,
+                                              CHILD_DATASET,
+                                              CELLBODY_NOT_ON_BORDER_DATASET){
+  Nucleus_information <- CELLBODY_NOT_ON_BORDER_DATASET %>% 
+    dplyr::filter(Children_Nucleus_segmentation_Count == 1) %>% 
+    dplyr::mutate(CELLBODY_NOT_ON_BORDER_ID = paste0(ImageNumber,'_',ObjectNumber),
+                  Parent_Segmentation_ID = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)) %>% 
+    #
+    dplyr::left_join(x = ., y = CHILD_DATASET %>%
+        dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbodies_NOT_ON_BORDER),
+                      'NUCLEUS_ID' = paste0(ImageNumber,'_',ObjectNumber)) %>%
+        dplyr::filter(!Parent_Cellbodies_NOT_ON_BORDER == 0) %>% 
+        dplyr::select(NUCLEUS_ID, PARENT_ID,
+                      'NumberOfNeighbors_nucleus' = contains('Neighbors_NumberOfNeighbors'),
+                      'PercentTouching_nucleus' = contains('Neighbors_PercentTouching')),
+        by = join_by(CELLBODY_NOT_ON_BORDER_ID == PARENT_ID)) %>% 
+    dplyr::select(CELLBODY_NOT_ON_BORDER_ID,
+                  Parent_Segmentation_ID,
+                  NUCLEUS_ID,
+                  NumberOfNeighbors_nucleus,
+                  PercentTouching_nucleus)
+    
+  #
+  single_nuclei_cellbody <- PARENT_DATASET %>% 
+    dplyr::mutate('OBJECT_ID' = paste0(ImageNumber,'_',ObjectNumber)) %>% 
+    dplyr::inner_join(x = ., y = Nucleus_information, by = join_by(OBJECT_ID == Parent_Segmentation_ID))%>%
+    dplyr::filter(NumberOfNeighbors_nucleus == 0 & PercentTouching_nucleus == 0)
+  
+  return(single_nuclei_cellbody)
+}
+```
+
+```{r Filter function FOUR For removing images with weird cell morphologies determined manually, echo=FALSE}
+
+# Reading in FOVs to remove
+FOVS_to_remove_df <- read_xlsx(path = fovs_to_remove_file,
+          sheet = sheet_name)
+
+
+# Function to remove the FOVs listed in the dataframe
+Remove_FOVs_manually <- function(CELL_DATA,
+                                 FOV_DATA,
+                                 EXP_REP){ # Numeric
+  # Selects only FOVS from specific REP
+  FOV_DATA_REP_SPECIFIC <- FOV_DATA %>%
+    dplyr::filter(Rep == EXP_REP)
+  
+  # Filters the cell data according to the FOVs to remove
+  CELL_DATA_FILTERED <- CELL_DATA %>% 
+    dplyr::mutate(FOV_ID = paste0('r',Metadata_Row,'c',Metadata_Column,'f',Metadata_FOV)) %>% 
+    dplyr::filter(!FOV_ID %in% FOV_DATA_REP_SPECIFIC$FOV_ID) %>% 
+    dplyr::select(-FOV_ID) # Removes the column used for pairing
+  #
+  return(CELL_DATA_FILTERED)
+}
+```
+
+
+```{r Function for cleaning up duplicated columns, echo=FALSE}
+# Function to remove duplicate columns and clean column names
+clean_duplicated_columns <- function(df) {
+  # Get column names
+  col_names <- names(df)
+  
+  # Extract base names (removing the "...x" suffix)
+  base_names <- gsub("\\.\\.\\.[0-9]+$", "", col_names)
+  
+  # Create a dataframe to track unique columns
+  col_df <- data.frame(
+    original_name = col_names,
+    base_name = base_names,
+    index = 1:length(col_names),
+    stringsAsFactors = FALSE
+  )
+  
+  # Keep first occurrence of each base name
+  keep_cols <- tapply(col_df$index, col_df$base_name, min)
+  
+  # Select only the columns to keep
+  clean_df <- df[, keep_cols]
+  
+  # Clean the column names by removing the "...x" suffix
+  names(clean_df) <- gsub("\\.\\.\\.[0-9]+$", "", names(clean_df))
+  
+  return(clean_df)
+}
+
+# Example usage
+# my_clean_df <- clean_duplicated_columns(my_df)
+```
+
+
+```{r Function to define transfected cells, echo = FALSE}
+#Intensity threshold to define transfected population and summary of transfection rates
+#####
+#Thresholds:
+Define_transfected <- function(DATASET, MEAN_INTENSITY_THRESHOLD, UPPER_QUARTILE_INTENSITY_THRESHOLD, EXP_SET, EXP_REP){
+  #
+  TRANSFECTION_DATASET <- DATASET  %>%
+    dplyr::mutate('TRANSFECTED' = Intensity_MeanIntensity_MCHERRY_BACKCORR > MEAN_INTENSITY_THRESHOLD & 
+                    Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR > UPPER_QUARTILE_INTENSITY_THRESHOLD)
+  
+  #
+  TRANSFECTION_SUMMARY <- TRANSFECTION_DATASET %>% 
+      ungroup() %>%
+      group_by(Metadata_Well, TRANSFECTED) %>% 
+      summarise(n = n()) %>%
+      ungroup() %>% 
+      pivot_wider(id_cols = c('Metadata_Well'), names_from = TRANSFECTED, names_prefix = 'Transfected_', values_from = c('n')) %>% 
+      dplyr::mutate('n_cells' = if_else(is.na(Transfected_TRUE) == TRUE, Transfected_FALSE, Transfected_TRUE + Transfected_FALSE),
+                'Trans_rate' = if_else(is.na(Transfected_TRUE) == TRUE, 0,Transfected_TRUE/n_cells * 100,0),
+                'MeanIntensity_Threshold' = MEAN_INTENSITY_THRESHOLD,
+                'UpperQuartileIntensity_Threshold' = UPPER_QUARTILE_INTENSITY_THRESHOLD) %>%
+      dplyr::mutate('Experiment_Set' =  EXP_SET,
+                'Experiment_Rep' = EXP_REP)
+      
+  TRANSFECTION_SUMMARY[is.na(TRANSFECTION_SUMMARY)] = 0
+  
+  #
+  TRANSFECTION_LIST <- list(TRANSFECTION_DATASET = TRANSFECTION_DATASET,
+                            TRANSFECTION_SUMMARY = TRANSFECTION_SUMMARY)
+  return(TRANSFECTION_LIST)
+}
+```
+
+
+## Replicate 1
+```{r Loading datasets from rep1, echo = FALSE, message = FALSE, warning=FALSE}
+# Read in PARENT_DATASET (CELLBODY)
+working_directory <- working_directory_rep1
+cellbody <- read_csv(paste0(working_directory,'/',cellbody_file))
+
+# Read in CHILD_DATASET (NUCLEI, CYTOPLASM)
+cellbody_not_on_border <- read_csv(paste0(working_directory,'/',cellbody_not_on_border_file))
+nuclei <- read_csv(paste0(working_directory,'/',nuclei_file))
+cytoplasm <- read_csv(paste0(working_directory,'/',cytoplasm_file))
+
+# Read in metadata  
+metadata <- read_csv(paste0(working_directory,'/',metadata_file)) %>%
+  dplyr::select(ImageNumber,Metadata_Row, Metadata_Column, Metadata_Well ,Group_Number, Group_Index,
+                c(starts_with('Classify'), starts_with('Count_Cellbodies'),starts_with('Count_Nucleus'), starts_with('Count_Segmentation')),
+                starts_with('PathName_')) %>% 
+    dplyr::mutate('Experiment_Set' = paste('SET_SNX2mutants'),
+                'Experiment_Rep' = paste0('REP_',substr(word(PathName_MCHERRY, start = 7, end = 7, sep = fixed("/")),4,4)), #(Whereas SetRep isn't required for the PC12s, I have included it as it may make the subsequent pipeline run more easily)
+                'Experiment_SetRep' = paste0(Experiment_Set,'_',Experiment_Rep))
+```
+
+
+```{r Applying all filter functions REP 1, echo = FALSE}
+#TEST OF ALL FILTERS
+ONE <- cell_classification(cellbody)
+TWO <- remove_high_touchpercent_cells(ONE, 90)
+THREE <- remove_cells_with_touching_nuclei(PARENT_DATASET = TWO,
+                                          CHILD_DATASET = nuclei,
+                                          CELLBODY_NOT_ON_BORDER_DATASET = cellbody_not_on_border)
+FOUR <- Remove_FOVs_manually(CELL_DATA = THREE,
+                             FOV_DATA = FOVS_to_remove_df,
+                             EXP_REP = 1)
+
+# Filtering the cellbodies not on border dataset according to cells retained in cell bodies (we do this as CELLBODIES Not on border had additional measurements made)
+FIVE <- FOUR %>%
+  #
+  dplyr::mutate('OBJECT_ID' = paste0(ImageNumber,'_',ObjectNumber)) %>% 
+  dplyr::select(OBJECT_ID) %>% 
+  dplyr::left_join(x = .,
+                   y = cellbody_not_on_border %>%  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)),
+                   by = join_by('OBJECT_ID' == 'PARENT_ID'),
+                   keep = TRUE) %>% 
+  dplyr::select(-OBJECT_ID)
+
+```
+
+
+```{r Removing additional columns and cleaning up df rep 1, echo =FALSE}
+# Generating a nuclei dataset for fusion that only contains minimal variables
+filtered_reduced_nuclei <- nuclei %>% 
+  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)) %>% 
+  dplyr::select(PARENT_ID, 'AreaShape_Area_NUCLEUS' = AreaShape_Area...12, 'AreaShape_Eccentricity_NUCLEUS' = AreaShape_Eccentricity...56)
+
+#
+cols_to_discard <- c('AreaShape_Center_X','AreaShape_Center_Y','AreaShape_Compactness','AreaShape_EquivalentDiameter','AreaShape_EulerNumber',
+                     'AreaShape_Solidity', 'AreaShape_Extent','AreaShape_BoundingBoxArea',
+                     'AreaShape_BoundingBoxMinimum_X','AreaShape_BoundingBoxMinimum_Y','AreaShape_BoundingBoxMaximum_X','AreaShape_BoundingBoxMaximum_Y',
+                     'AreaShape_ConvexArea','AreaShape_MajorAxisLength','AreaShape_MinorAxisLength',
+                     'AreaShape_Orientation','AreaShape_MaximumRadius','AreaShape_MedianRadius',
+                     'AreaShape_MeanRadius','AreaShape_MinFeretDiameter','AreaShape_MaxFeretDiameter',
+                     'Metadata_Row','Metadata_Column',
+                     'Metadata_Channel','Metadata_FOV','Metadata_FileLocation','Metadata_Frame','Metadata_Series','Metadata_Slice',
+                     'Children_Nucleus_segmentation_Count','Children_Cytoplasm_Count',
+                     'Parent_Cellbody_segmentation',
+                     'Classify_DYING_DIVIDING_CELL','Classify_PROPER_CELL')
+
+
+
+# Fusing the nuclei with the cellbodies and adding metadata from metadata file
+Filtered_cellbodies <- FIVE %>% 
+  dplyr::left_join(x = .,
+                   y = filtered_reduced_nuclei,
+                   by = join_by('PARENT_ID' == 'PARENT_ID')) %>% 
+  # Removes rows with no nucleus area.
+  dplyr::filter(!is.na(AreaShape_Area_NUCLEUS) == TRUE) %>% 
+  # Fusing with meta data
+  dplyr::left_join(x = ., y = metadata %>% dplyr::select(ImageNumber, Experiment_Set, Experiment_Rep, Experiment_SetRep), by = join_by('ImageNumber' == 'ImageNumber')) %>% 
+  #
+  clean_duplicated_columns() %>% 
+  #
+  dplyr::select(!all_of(cols_to_discard)) %>% 
+  dplyr::select(!(c(#starts_with('AreaShape_SpatialMoment_'), starts_with('AreaShape_CentralMoment'), starts_with('AreaShape_NormalizedMoment'),
+                    'AreaShape_NormalizedMoment_0_0','AreaShape_NormalizedMoment_0_1','AreaShape_NormalizedMoment_1_0',
+                    ends_with('_Object_prediction'),
+                    starts_with('Location_CenterMassIntensity_'),starts_with('Location_MaxIntensity_'), starts_with('Location_Center_')))) #%>%
+
+```
+
+```{r Plot used to define transfection cutoffs rep 1, echo = FALSE}
+#
+Mean_threshold_rep1 <- 0.0008
+Upperquantile_threshold_rep1 <- 0.00110
+
+
+Filtered_cellbodies %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep1, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep1, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.005), ylim = c(0, 0.005))+
+  theme_bw()
+
+
+Filtered_cellbodies %>% 
+  dplyr::filter(Metadata_Well == 'A01') %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  #facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep1, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep1, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.0015), ylim = c(0, 0.005))+
+  theme_bw()
+```
+
+```{r Assigning transfection status rep1, echo = FALSE, message = FALSE}
+Transfected_cells_and_summary <- Define_transfected(DATASET = Filtered_cellbodies,
+                                       MEAN_INTENSITY_THRESHOLD = Mean_threshold_rep1,
+                                       UPPER_QUARTILE_INTENSITY_THRESHOLD = Upperquantile_threshold_rep1,
+                                       EXP_SET = 'SET_SNX2mutants',
+                                       EXP_REP = 'REP_1')
+#
+Transfected_cellbodies <- Transfected_cells_and_summary$TRANSFECTION_DATASET
+Transfection_summary <- Transfected_cells_and_summary$TRANSFECTION_SUMMARY
+```
+
+
+```{r Save transfected data from rep 1, echo=FALSE}
+save(Transfected_cellbodies, file = paste0(working_directory,'/SET_SNX2mutants_REP1_TRANSFECTED_CELLS'))
+save(Transfection_summary, file = paste0(working_directory,'/SET_SNX2mutants_REP1_TRANSFECTION_SUMMARY'))
+```
+
+
+## Replicate 2
+```{r Loading datasets from rep2, echo = FALSE, message = FALSE, warning=FALSE}
+# Read in PARENT_DATASET (CELLBODY)
+working_directory <- working_directory_rep2
+cellbody <- read_csv(paste0(working_directory,'/',cellbody_file))
+
+# Read in CHILD_DATASET (NUCLEI, CYTOPLASM)
+cellbody_not_on_border <- read_csv(paste0(working_directory,'/',cellbody_not_on_border_file))
+nuclei <- read_csv(paste0(working_directory,'/',nuclei_file))
+cytoplasm <- read_csv(paste0(working_directory,'/',cytoplasm_file))
+
+# Read in metadata  
+metadata <- read_csv(paste0(working_directory,'/',metadata_file)) %>%
+  dplyr::select(ImageNumber,Metadata_Row, Metadata_Column, Metadata_Well ,Group_Number, Group_Index,
+                c(starts_with('Classify'), starts_with('Count_Cellbodies'),starts_with('Count_Nucleus'), starts_with('Count_Segmentation')),
+                starts_with('PathName_')) %>% 
+    dplyr::mutate('Experiment_Set' = paste('SET_SNX2mutants'),
+                'Experiment_Rep' = paste0('REP_',substr(word(PathName_MCHERRY, start = 7, end = 7, sep = fixed("/")),4,4)), #(Whereas SetRep isn't required for the PC12s, I have included it as it may make the subsequent pipeline run more easily)
+                'Experiment_SetRep' = paste0(Experiment_Set,'_',Experiment_Rep))
+```
+
+
+```{r Applying all filter functions REP 2, echo = FALSE}
+#TEST OF ALL FILTERS
+ONE <- cell_classification(cellbody)
+TWO <- remove_high_touchpercent_cells(ONE, 90)
+THREE <- remove_cells_with_touching_nuclei(PARENT_DATASET = TWO,
+                                          CHILD_DATASET = nuclei,
+                                          CELLBODY_NOT_ON_BORDER_DATASET = cellbody_not_on_border)
+FOUR <- Remove_FOVs_manually(CELL_DATA = THREE,
+                             FOV_DATA = FOVS_to_remove_df,
+                             EXP_REP = 2)
+
+# Filtering the cellbodies not on border dataset according to cells retained in cell bodies (we do this as CELLBODIES Not on border had additional measurements made)
+FIVE <- FOUR %>%
+  #
+  dplyr::mutate('OBJECT_ID' = paste0(ImageNumber,'_',ObjectNumber)) %>% 
+  dplyr::select(OBJECT_ID) %>% 
+  dplyr::left_join(x = .,
+                   y = cellbody_not_on_border %>%  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)),
+                   by = join_by('OBJECT_ID' == 'PARENT_ID'),
+                   keep = TRUE) %>% 
+  dplyr::select(-OBJECT_ID)
+
+```
+
+
+```{r Removing additional columns and cleaning up df rep 2, echo =FALSE}
+# Generating a nuclei dataset for fusion that only contains minimal variables
+filtered_reduced_nuclei <- nuclei %>% 
+  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)) %>% 
+  dplyr::select(PARENT_ID, 'AreaShape_Area_NUCLEUS' = AreaShape_Area...12, 'AreaShape_Eccentricity_NUCLEUS' = AreaShape_Eccentricity...56)
+
+#
+cols_to_discard <- c('AreaShape_Center_X','AreaShape_Center_Y','AreaShape_Compactness','AreaShape_EquivalentDiameter','AreaShape_EulerNumber',
+                     'AreaShape_Solidity', 'AreaShape_Extent','AreaShape_BoundingBoxArea',
+                     'AreaShape_BoundingBoxMinimum_X','AreaShape_BoundingBoxMinimum_Y','AreaShape_BoundingBoxMaximum_X','AreaShape_BoundingBoxMaximum_Y',
+                     'AreaShape_ConvexArea','AreaShape_MajorAxisLength','AreaShape_MinorAxisLength',
+                     'AreaShape_Orientation','AreaShape_MaximumRadius','AreaShape_MedianRadius',
+                     'AreaShape_MeanRadius','AreaShape_MinFeretDiameter','AreaShape_MaxFeretDiameter',
+                     'Metadata_Row','Metadata_Column',
+                     'Metadata_Channel','Metadata_FOV','Metadata_FileLocation','Metadata_Frame','Metadata_Series','Metadata_Slice',
+                     'Children_Nucleus_segmentation_Count','Children_Cytoplasm_Count',
+                     'Parent_Cellbody_segmentation',
+                     'Classify_DYING_DIVIDING_CELL','Classify_PROPER_CELL')
+
+
+
+# Fusing the nuclei with the cellbodies and adding metadata from metadata file
+Filtered_cellbodies <- FIVE %>% 
+  dplyr::left_join(x = .,
+                   y = filtered_reduced_nuclei,
+                   by = join_by('PARENT_ID' == 'PARENT_ID')) %>% 
+  # Removes rows with no nucleus area.
+  dplyr::filter(!is.na(AreaShape_Area_NUCLEUS) == TRUE) %>% 
+  # Fusing with meta data
+  dplyr::left_join(x = ., y = metadata %>% dplyr::select(ImageNumber, Experiment_Set, Experiment_Rep, Experiment_SetRep), by = join_by('ImageNumber' == 'ImageNumber')) %>% 
+  #
+  clean_duplicated_columns() %>% 
+  #
+  dplyr::select(!all_of(cols_to_discard)) %>% 
+  dplyr::select(!(c(#starts_with('AreaShape_SpatialMoment_'), starts_with('AreaShape_CentralMoment'), starts_with('AreaShape_NormalizedMoment'),
+                    'AreaShape_NormalizedMoment_0_0','AreaShape_NormalizedMoment_0_1','AreaShape_NormalizedMoment_1_0',
+                    ends_with('_Object_prediction'),
+                    starts_with('Location_CenterMassIntensity_'),starts_with('Location_MaxIntensity_'), starts_with('Location_Center_')))) #%>%
+
+```
+
+```{r Plot used to define transfection cutoffs rep 2, echo = FALSE}
+#
+Mean_threshold_rep2 <- 0.00070
+Upperquantile_threshold_rep2 <- 0.00100
+
+
+Filtered_cellbodies %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep2, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep2, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.005), ylim = c(0, 0.005))+
+  theme_bw()
+
+
+Filtered_cellbodies %>% 
+  dplyr::filter(Metadata_Well == 'A01') %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  #facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep2, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep2, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.0015), ylim = c(0, 0.005))+
+  theme_bw()
+```
+
+```{r Assigning transfection status rep2, echo = FALSE, message = FALSE}
+Transfected_cells_and_summary <- Define_transfected(DATASET = Filtered_cellbodies,
+                                       MEAN_INTENSITY_THRESHOLD = Mean_threshold_rep2,
+                                       UPPER_QUARTILE_INTENSITY_THRESHOLD = Upperquantile_threshold_rep2,
+                                       EXP_SET = 'SET_SNX2mutants',
+                                       EXP_REP = 'REP_2')
+#
+Transfected_cellbodies <- Transfected_cells_and_summary$TRANSFECTION_DATASET
+Transfection_summary <- Transfected_cells_and_summary$TRANSFECTION_SUMMARY
+#View(Transfection_summary)
+```
+
+
+```{r Save transfected data from rep 2, echo=FALSE}
+save(Transfected_cellbodies, file = paste0(working_directory,'/SET_SNX2mutants_REP2_TRANSFECTED_CELLS'))
+save(Transfection_summary, file = paste0(working_directory,'/SET_SNX2mutants_REP2_TRANSFECTION_SUMMARY'))
+```
+
+
+## Replicate 3
+```{r Loading datasets from rep3, echo = FALSE, message = FALSE, warning=FALSE}
+# Read in PARENT_DATASET (CELLBODY)
+working_directory <- working_directory_rep3
+cellbody <- read_csv(paste0(working_directory,'/',cellbody_file))
+
+# Read in CHILD_DATASET (NUCLEI, CYTOPLASM)
+cellbody_not_on_border <- read_csv(paste0(working_directory,'/',cellbody_not_on_border_file))
+nuclei <- read_csv(paste0(working_directory,'/',nuclei_file))
+cytoplasm <- read_csv(paste0(working_directory,'/',cytoplasm_file))
+
+# Read in metadata  
+metadata <- read_csv(paste0(working_directory,'/',metadata_file)) %>%
+  dplyr::select(ImageNumber,Metadata_Row, Metadata_Column, Metadata_Well ,Group_Number, Group_Index,
+                c(starts_with('Classify'), starts_with('Count_Cellbodies'),starts_with('Count_Nucleus'), starts_with('Count_Segmentation')),
+                starts_with('PathName_')) %>% 
+    dplyr::mutate('Experiment_Set' = paste('SET_SNX2mutants'),
+                'Experiment_Rep' = paste0('REP_',substr(word(PathName_MCHERRY, start = 7, end = 7, sep = fixed("/")),4,4)), #(Whereas SetRep isn't required for the PC12s, I have included it as it may make the subsequent pipeline run more easily)
+                'Experiment_SetRep' = paste0(Experiment_Set,'_',Experiment_Rep))
+```
+
+
+```{r Applying all filter functions REP 3, echo = FALSE}
+#TEST OF ALL FILTERS
+ONE <- cell_classification(cellbody)
+TWO <- remove_high_touchpercent_cells(ONE, 90)
+THREE <- remove_cells_with_touching_nuclei(PARENT_DATASET = TWO,
+                                          CHILD_DATASET = nuclei,
+                                          CELLBODY_NOT_ON_BORDER_DATASET = cellbody_not_on_border)
+FOUR <- Remove_FOVs_manually(CELL_DATA = THREE,
+                             FOV_DATA = FOVS_to_remove_df,
+                             EXP_REP = 3)
+
+# Filtering the cellbodies not on border dataset according to cells retained in cell bodies (we do this as CELLBODIES Not on border had additional measurements made)
+FIVE <- FOUR %>%
+  #
+  dplyr::mutate('OBJECT_ID' = paste0(ImageNumber,'_',ObjectNumber)) %>% 
+  dplyr::select(OBJECT_ID) %>% 
+  dplyr::left_join(x = .,
+                   y = cellbody_not_on_border %>%  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)),
+                   by = join_by('OBJECT_ID' == 'PARENT_ID'),
+                   keep = TRUE) %>% 
+  dplyr::select(-OBJECT_ID)
+
+```
+
+
+```{r Removing additional columns and cleaning up df rep 3, echo =FALSE}
+# Generating a nuclei dataset for fusion that only contains minimal variables
+filtered_reduced_nuclei <- nuclei %>% 
+  dplyr::mutate('PARENT_ID' = paste0(ImageNumber,'_',Parent_Cellbody_segmentation)) %>% 
+  dplyr::select(PARENT_ID, 'AreaShape_Area_NUCLEUS' = AreaShape_Area...12, 'AreaShape_Eccentricity_NUCLEUS' = AreaShape_Eccentricity...56)
+
+#
+cols_to_discard <- c('AreaShape_Center_X','AreaShape_Center_Y','AreaShape_Compactness','AreaShape_EquivalentDiameter','AreaShape_EulerNumber',
+                     'AreaShape_Solidity', 'AreaShape_Extent','AreaShape_BoundingBoxArea',
+                     'AreaShape_BoundingBoxMinimum_X','AreaShape_BoundingBoxMinimum_Y','AreaShape_BoundingBoxMaximum_X','AreaShape_BoundingBoxMaximum_Y',
+                     'AreaShape_ConvexArea','AreaShape_MajorAxisLength','AreaShape_MinorAxisLength',
+                     'AreaShape_Orientation','AreaShape_MaximumRadius','AreaShape_MedianRadius',
+                     'AreaShape_MeanRadius','AreaShape_MinFeretDiameter','AreaShape_MaxFeretDiameter',
+                     'Metadata_Row','Metadata_Column',
+                     'Metadata_Channel','Metadata_FOV','Metadata_FileLocation','Metadata_Frame','Metadata_Series','Metadata_Slice',
+                     'Children_Nucleus_segmentation_Count','Children_Cytoplasm_Count',
+                     'Parent_Cellbody_segmentation',
+                     'Classify_DYING_DIVIDING_CELL','Classify_PROPER_CELL')
+
+
+
+# Fusing the nuclei with the cellbodies and adding metadata from metadata file
+Filtered_cellbodies <- FIVE %>% 
+  dplyr::left_join(x = .,
+                   y = filtered_reduced_nuclei,
+                   by = join_by('PARENT_ID' == 'PARENT_ID')) %>% 
+  # Removes rows with no nucleus area.
+  dplyr::filter(!is.na(AreaShape_Area_NUCLEUS) == TRUE) %>% 
+  # Fusing with meta data
+  dplyr::left_join(x = ., y = metadata %>% dplyr::select(ImageNumber, Experiment_Set, Experiment_Rep, Experiment_SetRep), by = join_by('ImageNumber' == 'ImageNumber')) %>% 
+  #
+  clean_duplicated_columns() %>% 
+  #
+  dplyr::select(!all_of(cols_to_discard)) %>% 
+  dplyr::select(!(c(#starts_with('AreaShape_SpatialMoment_'), starts_with('AreaShape_CentralMoment'), starts_with('AreaShape_NormalizedMoment'),
+                    'AreaShape_NormalizedMoment_0_0','AreaShape_NormalizedMoment_0_1','AreaShape_NormalizedMoment_1_0',
+                    ends_with('_Object_prediction'),
+                    starts_with('Location_CenterMassIntensity_'),starts_with('Location_MaxIntensity_'), starts_with('Location_Center_')))) #%>%
+
+```
+
+```{r Plot used to define transfection cutoffs rep 3, echo = FALSE}
+#
+Mean_threshold_rep3 <- 0.00065
+Upperquantile_threshold_rep3 <- 0.00098
+
+
+Filtered_cellbodies %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep3, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep3, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.005), ylim = c(0, 0.005))+
+  theme_bw()
+
+
+Filtered_cellbodies %>% 
+  dplyr::filter(Metadata_Well == 'A01') %>% 
+  ggplot(aes(x = Intensity_MeanIntensity_MCHERRY_BACKCORR, y = Intensity_UpperQuartileIntensity_MCHERRY_BACKCORR))+
+  geom_point(alpha = 0.2)+
+  #facet_wrap(~Metadata_Well, nrow = 4)+
+  geom_vline(xintercept = Mean_threshold_rep3, color = 'red')+
+  geom_hline(yintercept = Upperquantile_threshold_rep3, color = 'red')+
+  coord_cartesian(xlim = c(0, 0.0015), ylim = c(0, 0.005))+
+  theme_bw()
+```
+
+```{r Assigning transfection status rep3, echo = FALSE, message = FALSE}
+Transfected_cells_and_summary <- Define_transfected(DATASET = Filtered_cellbodies,
+                                       MEAN_INTENSITY_THRESHOLD = Mean_threshold_rep3,
+                                       UPPER_QUARTILE_INTENSITY_THRESHOLD = Upperquantile_threshold_rep3,
+                                       EXP_SET = 'SET_SNX2mutants',
+                                       EXP_REP = 'REP_3')
+#
+Transfected_cellbodies <- Transfected_cells_and_summary$TRANSFECTION_DATASET
+Transfection_summary <- Transfected_cells_and_summary$TRANSFECTION_SUMMARY
+#View(Transfection_summary)
+```
+
+
+```{r Save transfected data from rep 3, echo=FALSE}
+save(Transfected_cellbodies, file = paste0(working_directory,'/SET_SNX2mutants_REP3_TRANSFECTED_CELLS'))
+save(Transfection_summary, file = paste0(working_directory,'/SET_SNX2mutants_REP3_TRANSFECTION_SUMMARY'))
+```
