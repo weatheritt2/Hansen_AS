@@ -1,8 +1,7 @@
-README for Kjer-Hansen et al. Alternative splicing fine-tunes modular protein interfaces to control protein localisation
+# README for Kjer-Hansen et al. Alternative splicing fine-tunes modular protein interfaces to control protein localisation
 
-Script 1:
 
-# Percolation analysis with degree-matched nulls, κ(f), AUC tests, and inter-community enrichment (v2)
+# Script 1: Percolation analysis with degree-matched nulls, κ(f), AUC tests, and inter-community enrichment (v2)
 
 `percolation_auc_plus_v2.py` runs a percolation-style robustness analysis on an interaction network by removing edges in **descending AS priority** (e.g. `as_prob`) and comparing the resulting fragmentation/efficiency curves to **replicate null distributions**. It supports two metrics—largest component fraction **S(f)** and approximate global efficiency **E(f)**—and produces paired **Δ(f) = AS − null** curves with confidence intervals, **AUC-based significance tests**, **κ(f)** (number of connected components), and **inter-community edge removal enrichment** with per-f empirical p-values.
 
@@ -58,9 +57,9 @@ python percolation_auc_plus_v2.py \
 
 ---
 
-Script 2: 
 
-# CatBoost + SHAP interaction modeling for AS impact (v3)
+
+# Script 2: CatBoost + SHAP interaction modeling for AS impact (v3)
 
 `node_feature_models_catboost_with_interactions_v3.py` trains a **CatBoost regression model** to predict alternative splicing (AS) “impact” from a combined feature table, and produces **feature attributions** via **SHAP values** and **SHAP interaction values** (global heatmap + selected dependence plots). It also runs a “safe” **OLS sanity-check** by dummy-coding categorical variables into a numeric design matrix.
 
@@ -104,9 +103,7 @@ python node_feature_models_catboost_with_interactions_v3.py \
 
 ---  
 
-Script 3:
-
-# ΔS/ΔE feature modeling pipeline (v1)
+# Script 3: ΔS/ΔE feature modeling pipeline (v1)
 
 `node_feature_models_v3.py` is an end-to-end analysis script for relating **ΔS** and **ΔE** (splicing / expression impact metrics) to molecular and network features from either **edge-level** or **node-level** tables (e.g. `impact.tsv`). It runs **univariate association tests**, **multivariate OLS** (numeric/binary only), and **Random Forest** models (with permutation importance and optional SHAP), plus an optional **joint multi-output RF** predicting ΔS and ΔE simultaneously.
 
@@ -162,9 +159,8 @@ python node_feature_models_v1.py \
 ```
 
 ---
-Script 4:
 
-# Single-input enrichment workflow + optional quantile regression
+# Script 4: Single-input enrichment workflow + optional quantile regression
 
 `node_enrichment_qreg_single.py` runs a single-table workflow on `node_impact_with_features.tsv` to test whether molecular/network features are enriched across **ΔE / ΔS** (or other metric) values. For each metric and feature, it produces (i) **quantile-bin trends**, (ii) **tail comparisons** (top vs bottom extremes), and (iii) **permutation-based null Z-scores** for bin-wise enrichment. Optionally, it also fits **quantile regression** (25th/50th/75th percentiles) for numeric features.
 
@@ -221,9 +217,8 @@ python node_enrichment_qreg_single.py \
 ```
 
 ---
-Script 5:
 
-# Plot OLS coefficient summaries from a TSV
+# Script 5: Plot OLS coefficient summaries from a TSV
 
 `plot_coefficients_from_tsv.py` reads an OLS coefficient summary table (TSV/CSV) and generates two publication-ready visualizations:
 
@@ -262,9 +257,7 @@ python plot_coefficients_from_tsv.py
 
 ---
 
-Script 6:
-
-# Microexon vs long-exon residue and feature enrichment (v2)
+# Script 6: Microexon vs long-exon residue and feature enrichment (v2)
 
 `microexon_residue_enrichment_v2.py` performs a **comparative amino-acid composition analysis** between **microexons (MICRO)** and **long exons (LONG)** across exon bodies and flanking regions. It reports **per-residue** and **per-feature (AA class)** enrichments using Fisher’s exact tests, provides **log2 enrichment effect sizes**, and applies **Benjamini–Hochberg FDR correction** within biologically meaningful strata.
 
