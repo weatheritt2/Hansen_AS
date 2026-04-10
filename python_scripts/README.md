@@ -317,3 +317,65 @@ python microexon_residue_enrichment_v2.py \
 ```
 
 ---
+Script 7: protGPS localisation scoring for AS events + exon/IDR summary outputs (portable)
+
+AS_events_protGPS.py is a takes an alternative splicing (AS) event table and runs protGPS to quantify predicted localisation changes. 
+
+## Requirements
+
+Python packages (minimum practical set):
+	•	pandas, numpy
+	•	torch
+	•	scikit-learn
+	•	matplotlib, seaborn
+	•	POT (imported as ot)
+	•	protGPS (must be importable; script exits cleanly with guidance if missing)
+
+## Inputs
+
+Required:
+	•	Ensembl ↔ UniProt mapping table 
+	•	UniProt FASTA exported from Ensembl BioMart 
+	•	Event table 
+
+## Usage
+
+Basic run example:
+
+```bash
+python AS_events_protGPS.py \
+  --event-table Gini_data4peptide_full-Hsa_peptides_vCombined.tab \
+  --ensembl-uniprot-map GRCh37.p12_ensembl_uniprot.txt \
+  --uniprot-fasta uniprot_GRCh38.p14_protsequence.fa.txt \
+  --args-pkl checkpoints/protgps/model.args \
+  --model-ckpt checkpoints/protgps/model.ckpt \
+  --pretrained-hub-dir esm2/esm \
+  --output-dir protgps_outputs```
+
+# Script 8: Residue-level interface overlap annotation from multiple PPI interface resources 
+
+interface_interactome_creator.py is a fixed-column, residue-level overlap annotator. Given a query file of canonical UniProt proteins and AA start/end positions, it identifies overlaps against interface annotations from IntAct, 3DID, Interactome3D, ELM, DOMINO, and/or PDB. 
+
+## Data sources (download pages)
+	•	IntAct: https://www.ebi.ac.uk/intact/download
+	•	3DID: https://3did.irbbarcelona.org/download.php
+	•	Interactome3D: https://interactome3d.irbbarcelona.org/download.php
+	•	ELM: http://elm.eu.org/
+	•	DOMINO: http://mint.bio.uniroma2.it/domino/
+	•	PDB: https://www.rcsb.org/downloads
+
+## Requirements
+
+Python packages:
+	•	None beyond the standard library (Python ≥3.8 recommended)
+
+## Usage
+
+Basic run example:
+
+```bash
+python interface_interactome_creator.py \
+  --queries queries.tsv \
+  --intact intact.tsv \
+  --out-prefix results/intact_only
+```
