@@ -366,6 +366,15 @@ python AS_events_protGPS.py \
 
 interface_interactome_creator.py is a fixed-column, residue-level overlap annotator. Given a query file of canonical UniProt proteins and AA start/end positions, it identifies overlaps against interface annotations from IntAct, 3DID, Interactome3D, ELM, DOMINO, and/or PDB. 
 
+---
+## What this script does
+	1.	Reads query intervals
+Input: uniprot_canonical, start_aa_position, end_aa_position (plus optional query_id)
+	2.	Loads any subset of databases you provide
+You may pass only one of --intact, --threedid, --interactome3d, --elm, --domino, --pdb and it will run.
+	3.	Finds overlaps at residue resolution
+A query interval overlaps an interface if the intersection length is ≥1 aa.
+---
 ## Data sources (download pages)
 	•	IntAct: https://www.ebi.ac.uk/intact/download
 	•	3DID: https://3did.irbbarcelona.org/download.php
