@@ -306,6 +306,8 @@ Given a sequence-context file describing microexon and long-exon events, the scr
 A text file (e.g. `microexon_seqs.txt`) where each non-comment line contains:
 <upstream_seq> <exon_seq> <downstream_seq> <structure_token> … MICRO|LONG …
 
+---
+
 ## Usage
 
 Basic run example:
@@ -317,7 +319,8 @@ python microexon_residue_enrichment_v2.py \
 ```
 
 ---
-Script 7: protGPS localisation scoring for AS events + exon/IDR summary outputs (portable)
+
+# Script 7: protGPS localisation scoring for AS events + exon/IDR summary outputs (portable)
 
 AS_events_protGPS.py is a takes an alternative splicing (AS) event table and runs protGPS to quantify predicted localisation changes. 
 
@@ -331,12 +334,16 @@ Python packages (minimum practical set):
 	•	POT (imported as ot)
 	•	protGPS (must be importable; script exits cleanly with guidance if missing)
 
+---
+
 ## Inputs
 
 Required:
 	•	Ensembl ↔ UniProt mapping table 
 	•	UniProt FASTA exported from Ensembl BioMart 
 	•	Event table 
+
+---
 
 ## Usage
 
@@ -350,7 +357,10 @@ python AS_events_protGPS.py \
   --args-pkl checkpoints/protgps/model.args \
   --model-ckpt checkpoints/protgps/model.ckpt \
   --pretrained-hub-dir esm2/esm \
-  --output-dir protgps_outputs```
+  --output-dir protgps_outputs
+```
+
+---
 
 # Script 8: Residue-level interface overlap annotation from multiple PPI interface resources 
 
@@ -364,10 +374,14 @@ interface_interactome_creator.py is a fixed-column, residue-level overlap annota
 	•	DOMINO: http://mint.bio.uniroma2.it/domino/
 	•	PDB: https://www.rcsb.org/downloads
 
+---
+
 ## Requirements
 
 Python packages:
 	•	None beyond the standard library (Python ≥3.8 recommended)
+
+---
 
 ## Usage
 
